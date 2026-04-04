@@ -104,7 +104,7 @@ router.post('/export/fetch', requireConnectionAccess('id'), async (req, res) => 
             try {
                 const allCols = await Promise.race([ setup.executeQuery(`SELECT table_name, column_name, data_type, comment FROM information_schema.columns WHERE table_schema = '${req.body.db}'`), new Promise((_, r) => setTimeout(() => r(new Error("FAST_TIMEOUT")), 15000)) ]);
                 if (allCols && allCols.length > 0) { allCols.forEach(r => { const override = dbMeta[Object.values(r)[0]]?.[Object.values(r)[1]]; worksheet.addRow({ db: req.body.db, table: Object.values(r)[0], column: Object.values(r)[1], type: Object.values(r)[2] || '', comment: override || Object.values(r)[3] || '' }); }); }
-            } catch (err) { } finally { try{if(setup.session) await setup.session.close();}catch(e){} try{if(setup.client) await setup.client.close();}catch(e){} }
+            } catch (err) { console.warn('[Export] Hive info_schema query failed:', err.message); } finally { try{if(setup.session) await setup.session.close();}catch(e){ console.warn('[Export] Hive session close failed:', e.message); } try{if(setup.client) await setup.client.close();}catch(e){ console.warn('[Export] Hive client close failed:', e.message); } }
         }
         res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'); res.setHeader('Content-Disposition', `attachment; filename="${req.body.db}_data_dictionary.xlsx"`);
         await workbook.xlsx.write(res); res.end();
@@ -162,14 +162,18 @@ router.post('/explore/query', requireConnectionAccess('connection_id'), async (r
         let results = [];
         const connection = await getSrConnection(conn.host, conn.type === 'starrocks' ? conn.port : 9030, conn.type === 'starrocks' ? conn.username : (conn.sr_username || 'root'), conn.type === 'starrocks' ? decrypt(conn.password) : (decrypt(conn.sr_password) || ''));
         
+        // FIX #17: inject LIMIT if query has none, cap at 500 rows fetched from DB
+        const hasLimit = /\bLIMIT\s+\d+/i.test(safeQuery);
+        const execQuery = hasLimit ? safeQuery : `${safeQuery} LIMIT 500`;
+
         try {
             if (conn.type === 'hive') await connection.query('SET CATALOG hudi_catalog;');
             if (db_name) await connection.query(`USE \`${db_name}\``);
-            const [dataRows] = await connection.query(safeQuery);
+            const [dataRows] = await connection.query(execQuery);
             results = dataRows;
         } finally { await connection.end(); }
-        
-        const limitedResults = Array.isArray(results) ? results.slice(0, 100) : [results];
+
+        const limitedResults = Array.isArray(results) ? results.slice(0, 500) : [results];
         const maskedResults = limitedResults.map(row => { if (typeof row !== 'object' || row === null) return { result: maskDataPreview(row, 'result') }; const maskedRow = {}; for (let [key, val] of Object.entries(row)) { maskedRow[key] = maskDataPreview(val, key); } return maskedRow; });
         res.json(maskedResults);
     } catch (e) { console.error("[Workbench Error]:", e); res.status(500).json({ error: "Query execution failed." }); }
@@ -213,7 +217,7 @@ router.post('/explore/table-details', requireConnectionAccess('connection_id'), 
                         const indexLen = parseInt(statusRes[0].Index_length || 0);
                         if (dataLen > 0) tableSize = formatBytes(dataLen + indexLen);
                     }
-                } catch(e) {} 
+                } catch(e) { console.warn('[TableDetails] Size fetch (StarRocks) failed:', e.message); }
             } else if (conn.type === 'hive') {
                 try {
                     let setup = await setupHiveClient(conn);
@@ -258,7 +262,7 @@ router.post('/explore/table-details', requireConnectionAccess('connection_id'), 
                         hudiConfig.precombineKey = parseProp(createStmt, 'hoodie.datasource.write.precombine.field');
                         hudiConfig.partitionFields = parseProp(createStmt, 'hoodie.datasource.write.partitionpath.field');
                     }
-                } catch(e) {} // Fallback gracefully if DDL can't be fetched
+                } catch(e) { console.warn('[TableDetails] DDL/Hudi parse failed:', e.message); }
             }
         } finally {
             await connection.end();

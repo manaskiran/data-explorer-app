@@ -120,6 +120,46 @@ app.use(cookieParser());
 // ─── Body parsing ─────────────────────────────────────────────────────────────
 app.use(express.json({ limit: '5mb' }));
 
+// ─── Response size guard (FIX #22) ───────────────────────────────────────────
+// Caps JSON responses at 10 MB to prevent unbounded payload growth
+const MAX_RESPONSE_BYTES = 10 * 1024 * 1024; // 10 MB
+app.use((req, res, next) => {
+    const _json = res.json.bind(res);
+    res.json = function (body) {
+        try {
+            const size = Buffer.byteLength(JSON.stringify(body), 'utf8');
+            if (size > MAX_RESPONSE_BYTES) {
+                console.warn(`[ResponseGuard] Payload ${size} bytes exceeds limit on ${req.path}`);
+                return res.status(413).set('Content-Type', 'application/json').end(
+                    JSON.stringify({ error: 'Response payload too large. Apply stricter filters or pagination.' })
+                );
+            }
+        } catch (_) {}
+        return _json(body);
+    };
+    next();
+});
+
+// ─── Consistent error shape helper (FIX #21) ─────────────────────────────────
+// All routes use { error: "..." } — this catches any accidental deviations
+app.use((req, res, next) => {
+    const _status = res.status.bind(res);
+    res.status = function (code) {
+        const r = _status(code);
+        if (code >= 400) {
+            const _json = r.json.bind(r);
+            r.json = function (body) {
+                if (body && typeof body === 'object' && !body.error && body.message) {
+                    body = { error: body.message };
+                }
+                return _json(body);
+            };
+        }
+        return r;
+    };
+    next();
+});
+
 // ─── Request ID + structured access log with duration ─────────────────────────
 app.use((req, res, next) => {
     req.id = crypto.randomUUID();
