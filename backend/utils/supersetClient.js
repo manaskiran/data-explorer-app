@@ -26,7 +26,7 @@ const VIZ_TYPE_MAP = {
     // ── Part-of-whole / Distribution ───────────────────────────────────────────
     pie:                            'pie',
     donut:                          'pie',
-    funnel_chart:                   'funnel_chart',
+    funnel_chart:                   'pie',             // funnel_chart not available in all Superset versions
     treemap:                        'treemap_v2',
     treemap_v2:                     'treemap_v2',
     sunburst:                       'sunburst',
@@ -460,6 +460,26 @@ class SupersetClient {
             verbose_name: m.verbose_name,
         }));
 
+        // Auto-configure main_dttm_col if not set — required for time-series charts and time filters.
+        // We also mark the column is_dttm=true so Superset recognises it as temporal.
+        const existingDttm = ds.main_dttm_col;
+        const dtCol = columns.find(c => c.is_dttm || c.type === 'DATETIME');
+        if ((!existingDttm || !columns.find(c => c.is_dttm)) && dtCol) {
+            try {
+                // Include is_dttm:true on the target column so Superset marks it correctly.
+                const updatedCols = (ds.columns || []).map(c =>
+                    c.column_name === dtCol.column_name ? { ...c, is_dttm: true } : c
+                );
+                await this._request('PUT', `/api/v1/dataset/${datasetId}`, {
+                    main_dttm_col: dtCol.column_name,
+                    columns: updatedCols,
+                });
+                // Reflect is_dttm in our local column list too
+                const idx = columns.findIndex(c => c.column_name === dtCol.column_name);
+                if (idx !== -1) columns[idx] = { ...columns[idx], is_dttm: true };
+            } catch (_) { /* non-critical */ }
+        }
+
         return { id: datasetId, name: ds.table_name || ds.datasource_name || '', columns, metrics };
     }
 
@@ -562,13 +582,18 @@ class SupersetClient {
             else if (f.filter_type === 'numerical') filterType = 'filter_range';
             else filterType = 'filter_select';
 
+            // filter_time targets the dataset's main timestamp — no column needed
+            const targets = filterType === 'filter_time'
+                ? [{ datasetId: f._dataset_id || datasetId }]
+                : [{ datasetId: f._dataset_id || datasetId, column: { name: f.column_name } }];
+
             return {
                 id: filterId,
                 name: f.label,
                 filterType,
-                targets: [{ datasetId, column: { name: f.column_name } }],
+                targets,
                 defaultDataMask: { filterState: { value: f.default_value } },
-                controlValues: { multiSelect: true, enableEmptyFilter: false },
+                controlValues: { multiSelect: filterType !== 'filter_range', enableEmptyFilter: false },
                 cascadeParentIds: [],
                 scope: { rootPath: ['ROOT_ID'], excluded: [] },
             };
@@ -616,6 +641,8 @@ class SupersetClient {
         // Superset returns { id } or { data: { id } } depending on version
         const id = data.id || data.data?.id;
         if (!id) throw new Error(`Dataset created but no ID returned: ${JSON.stringify(data)}`);
+        // Refresh schema so Superset auto-detects column types (including is_dttm for DATE cols)
+        try { await this._request('PUT', `/api/v1/dataset/${id}/refresh`); } catch (_) {}
         return id;
     }
 

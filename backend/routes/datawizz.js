@@ -535,13 +535,18 @@ async function fetchSchemaFromExplorer(connectionId, dbName, tableName, pgPool) 
         const colName = row.Field || row.col_name || row.COLUMN_NAME || Object.values(row)[0];
         const rawType = row.Type || row.data_type || row.DATA_TYPE || '';
         const normalizedType = normalizeColType(rawType);
+        // LLM-generated column_comments may be objects {title, description} instead of plain strings
+        const rawComment = columnComments[colName];
+        const comment = (typeof rawComment === 'object' && rawComment !== null)
+            ? (rawComment.description || rawComment.title || '')
+            : (rawComment || row.Comment || '');
         return {
             column_name: colName,
             type: normalizedType,
             is_dttm: normalizedType === 'DATETIME',
             expression: null,
             distinct_values: null,
-            comment: columnComments[colName] || row.Comment || '',
+            comment: String(comment),
         };
     });
 
@@ -555,6 +560,156 @@ async function fetchSchemaFromExplorer(connectionId, dbName, tableName, pgPool) 
         description: meta.description || '',
         use_case: meta.use_case || '',
         column_comments: columnComments,
+    };
+}
+
+// ── Plan column validator ─────────────────────────────────────────────────────
+/**
+ * After LLM generates a plan, validate and fix all column references against
+ * the real schema. Prevents "Column missing in dataset" errors in Superset.
+ */
+function validateAndFixPlan(dashboardPlan, datasetInfo) {
+    const cols = datasetInfo.columns || [];
+
+    // Index real columns for fast lookup
+    const exactSet = new Set(cols.map(c => c.column_name));
+    const lowerMap = new Map(cols.map(c => [c.column_name.toLowerCase(), c.column_name]));
+    const allNames = cols.map(c => c.column_name);
+
+    function findBest(colName) {
+        if (!colName) return null;
+        // Strip table prefix if present
+        const name = colName.includes('.') ? colName.slice(colName.lastIndexOf('.') + 1) : colName;
+        // 1. Exact
+        if (exactSet.has(name)) return name;
+        // 2. Case-insensitive
+        if (lowerMap.has(name.toLowerCase())) return lowerMap.get(name.toLowerCase());
+        // 3. Partial / contains match (e.g. "status_code" → "status", "project_id" → "project_uuid")
+        const low = name.toLowerCase();
+        for (const real of allNames) {
+            const rLow = real.toLowerCase();
+            if (rLow.includes(low) || low.includes(rLow)) return real;
+        }
+        return null;
+    }
+
+    const fixedCharts = [];
+    for (const chart of dashboardPlan.charts || []) {
+        // Fix metrics
+        const fixedMetrics = (chart.metrics || []).map(m => {
+            if (m.aggregate === 'COUNT') return m; // COUNT(*) never needs a real column
+            if (!m.column?.column_name) return m;
+            const fixed = findBest(m.column.column_name);
+            if (!fixed) return null; // drop unmappable metric
+            return { ...m, column: { ...m.column, column_name: fixed }, label: `${m.aggregate}(${fixed})` };
+        }).filter(Boolean);
+
+        if (!fixedMetrics.length) continue; // skip charts with no valid metrics
+
+        const fixedGroupby = (chart.groupby || []).map(c => findBest(c)).filter(Boolean);
+        const fixedTimeCol = chart.time_column ? findBest(chart.time_column) : null;
+
+        fixedCharts.push({
+            ...chart,
+            metrics: fixedMetrics,
+            groupby: fixedGroupby,
+            time_column: fixedTimeCol,
+        });
+    }
+
+    // Fix filters
+    const fixedFilters = (dashboardPlan.filters || []).map(f => {
+        const fixed = findBest(f.column_name);
+        return fixed ? { ...f, column_name: fixed } : null;
+    }).filter(Boolean);
+
+    return { ...dashboardPlan, charts: fixedCharts, filters: fixedFilters };
+}
+
+// ── Multi-source build helpers ────────────────────────────────────────────────
+
+/** Extract table prefix from a qualified column name ("table.col" → "table") */
+function extractTablePrefix(colName) {
+    const dot = (colName || '').indexOf('.');
+    return dot > 0 ? colName.slice(0, dot) : null;
+}
+
+/** Strip table prefix from a qualified column name */
+function stripPrefix(colName) {
+    const dot = (colName || '').indexOf('.');
+    return dot > 0 ? colName.slice(dot + 1) : colName;
+}
+
+/** Vote on which source table a chart belongs to based on column references */
+function detectChartTable(chartSpec, knownTables) {
+    const votes = new Map();
+    const vote = (col) => {
+        const prefix = extractTablePrefix(col);
+        if (prefix && knownTables.has(prefix)) {
+            votes.set(prefix, (votes.get(prefix) || 0) + 1);
+        }
+    };
+    for (const m of chartSpec.metrics || []) {
+        if (m.column?.column_name) vote(m.column.column_name);
+    }
+    for (const col of chartSpec.groupby || []) vote(col);
+    if (chartSpec.time_column) vote(chartSpec.time_column);
+    if (!votes.size) return null;
+    return [...votes.entries()].sort((a, b) => b[1] - a[1])[0][0];
+}
+
+/**
+ * Filter a chart spec to only columns that actually exist in the target Superset dataset.
+ * Prevents "Column cannot be resolved" errors from cross-table references.
+ * Returns null if the chart has no valid metrics after filtering (chart should be skipped).
+ */
+function filterChartToDataset(chartSpec, datasetColumns) {
+    const available = new Set(
+        (datasetColumns || []).map(c => (c.column_name || c.name || '').toLowerCase())
+    );
+    const has = (col) => available.has((col || '').toLowerCase());
+
+    const fixedMetrics = (chartSpec.metrics || []).map(m => {
+        if (m.aggregate === 'COUNT') return m; // COUNT(*) always valid
+        const col = m.column?.column_name;
+        return (col && has(col)) ? m : null;
+    }).filter(Boolean);
+
+    if (!fixedMetrics.length) return null; // chart has no valid metrics — skip it
+
+    // Resolve time_column: if the original time_column is not in this dataset,
+    // fall back to the first DATETIME column available so time-series charts don't fail.
+    let fixedTimeCol = (chartSpec.time_column && has(chartSpec.time_column)) ? chartSpec.time_column : null;
+    if (!fixedTimeCol && chartSpec.time_column) {
+        const dtCol = (datasetColumns || []).find(c => c.is_dttm || c.type === 'DATETIME');
+        if (dtCol) fixedTimeCol = dtCol.column_name || dtCol.name;
+    }
+
+    return {
+        ...chartSpec,
+        metrics:     fixedMetrics,
+        groupby:     (chartSpec.groupby || []).filter(c => has(c)),
+        time_column: fixedTimeCol,
+        filters:     (chartSpec.filters || []).filter(f => has(f.col)),
+    };
+}
+
+/** Remove table prefixes from all column references in a chart spec */
+function dequalifyChart(chartSpec) {
+    const strip = (col) => stripPrefix(col);
+    return {
+        ...chartSpec,
+        metrics: (chartSpec.metrics || []).map(m => ({
+            ...m,
+            column: m.column ? { ...m.column, column_name: strip(m.column.column_name) } : m.column,
+            label: m.label ? m.label.replace(/\b\w+\./g, '') : m.label,
+        })),
+        groupby: (chartSpec.groupby || []).map(strip),
+        time_column: chartSpec.time_column ? strip(chartSpec.time_column) : chartSpec.time_column,
+        filters: (chartSpec.filters || []).map(f => ({
+            ...f,
+            col: f.col ? strip(f.col) : f.col,
+        })),
     };
 }
 
@@ -611,14 +766,33 @@ router.post('/superset/datasets', async (req, res) => {
  * GET /api/datawizz/plan — SSE endpoint
  * Runs RequirementsParser + ChartStrategist and streams progress.
  *
- * Query params: connection_id, db_name, table_name, dashboard_title, requirements
+ * Query params: sources (JSON array of {connection_id, db_name, table_name}), dashboard_title, requirements
+ * Backward compat: also accepts connection_id, db_name, table_name as individual params.
  */
 router.get('/plan', async (req, res) => {
-    const { connection_id, db_name, table_name } = req.query;
+    let sources;
+    try {
+        if (req.query.sources) {
+            sources = JSON.parse(req.query.sources);
+        } else {
+            // backward compat — single source
+            const { connection_id, db_name, table_name } = req.query;
+            sources = [{ connection_id, db_name, table_name }];
+        }
+    } catch {
+        return res.status(400).json({ error: 'Invalid sources parameter — must be a JSON array.' });
+    }
+
     const dashboard_title = sanitizePromptInput(req.query.dashboard_title || '', 200);
     const requirements    = sanitizePromptInput(req.query.requirements   || '', 2000);
-    if (!connection_id || !db_name || !table_name || !requirements) {
-        return res.status(400).json({ error: 'connection_id, db_name, table_name, and requirements are required.' });
+
+    if (!sources.length || !requirements) {
+        return res.status(400).json({ error: 'sources and requirements are required.' });
+    }
+    for (const s of sources) {
+        if (!s.connection_id || !s.db_name || !s.table_name) {
+            return res.status(400).json({ error: 'Each source must have connection_id, db_name, and table_name.' });
+        }
     }
 
     res.setHeader('Content-Type', 'text/event-stream');
@@ -627,13 +801,44 @@ router.get('/plan', async (req, res) => {
     res.flushHeaders();
 
     try {
-        // Step 1: Fetch schema from Data Explorer
-        sseEmit(res, 'progress', { message: '🔍 Fetching schema and metadata from Data Explorer...', step: 1, total: 4 });
-        const datasetInfo = await fetchSchemaFromExplorer(
-            parseInt(connection_id), db_name, table_name, pgPool
-        );
+        // Step 1: Fetch schema for all sources
         sseEmit(res, 'progress', {
-            message: `✅ Schema loaded — ${datasetInfo.columns.length} columns found.`,
+            message: `🔍 Fetching schema for ${sources.length} table(s)…`,
+            step: 1, total: 5,
+        });
+
+        const allDatasets = await Promise.all(
+            sources.map(s => fetchSchemaFromExplorer(parseInt(s.connection_id), s.db_name, s.table_name, pgPool))
+        );
+
+        // Combine into a single datasetInfo (prefix column names with table name when multiple tables)
+        let datasetInfo;
+        if (allDatasets.length === 1) {
+            datasetInfo = allDatasets[0];
+        } else {
+            const combinedColumns = allDatasets.flatMap(ds =>
+                ds.columns.map(col => ({
+                    ...col,
+                    column_name: `${ds.table_name}.${col.column_name}`,
+                    _table: ds.table_name,
+                }))
+            );
+            const combinedComments = Object.assign({}, ...allDatasets.map(ds =>
+                Object.fromEntries(Object.entries(ds.column_comments || {}).map(([k, v]) => [`${ds.table_name}.${k}`, v]))
+            ));
+            datasetInfo = {
+                ...allDatasets[0],
+                name: allDatasets.map(d => d.table_name).join(', '),
+                table_name: allDatasets.map(d => d.table_name).join(', '),
+                columns: combinedColumns,
+                description: allDatasets.map(d => d.description).filter(Boolean).join(' | '),
+                column_comments: combinedComments,
+                _tables: allDatasets.map(d => ({ name: d.table_name, db: d.db_name })),
+            };
+        }
+
+        sseEmit(res, 'progress', {
+            message: `✅ Schema loaded — ${sources.length} table(s), ${datasetInfo.columns.length} columns total.`,
             step: 1, total: 4,
         });
 
@@ -664,8 +869,20 @@ router.get('/plan', async (req, res) => {
             step: 3, total: 4,
         });
 
-        // Done — return plan + datasetInfo for the build step
-        sseEmit(res, 'done', { plan: dashboardPlan, datasetInfo, parsedRequirements });
+        // Step 4: Validate all column references against actual schema (prevents Superset "Column missing" errors)
+        sseEmit(res, 'progress', {
+            message: '🔎 Validating column names against real schema...',
+            step: 4, total: 4,
+        });
+        const validatedPlan = validateAndFixPlan(dashboardPlan, datasetInfo);
+        const dropped = (dashboardPlan.charts?.length || 0) - (validatedPlan.charts?.length || 0);
+        sseEmit(res, 'progress', {
+            message: `✅ Columns validated — ${validatedPlan.charts?.length} chart(s) ready${dropped > 0 ? `, ${dropped} dropped (unmappable columns)` : ''}.`,
+            step: 4, total: 4,
+        });
+
+        // Done — return validated plan + datasetInfo for the build step
+        sseEmit(res, 'done', { plan: validatedPlan, datasetInfo, parsedRequirements });
     } catch (e) {
         sseEmit(res, 'error', { message: e.message });
     } finally {
@@ -697,6 +914,9 @@ router.post('/build', async (req, res) => {
     res.setHeader('Connection', 'keep-alive');
     res.flushHeaders();
 
+    // Heartbeat every 15 s — keeps the SSE connection alive through long LLM/Superset calls
+    const heartbeat = setInterval(() => { try { res.write(': ping\n\n'); } catch (_) {} }, 15000);
+
     try {
         const totalSteps = 7;
 
@@ -710,36 +930,116 @@ router.post('/build', async (req, res) => {
         await client.authenticate();
         sseEmit(res, 'progress', { message: '✅ Superset authenticated.', step: 1, total: totalSteps });
 
-        // Step 2: Fetch or auto-create Superset dataset
-        // Use actual table_name from datasetInfo (not the user label) for lookup/creation
-        const actualTableName = datasetInfo?.table_name || datasetInfo?.name || dataset_name;
-        const actualSchema    = datasetInfo?.db_name || '';
-        sseEmit(res, 'progress', {
-            message: `📊 Looking up Superset dataset: "${actualTableName}"...`,
-            step: 2, total: totalSteps,
-        });
-        const supersetDataset = await client.getOrCreateDataset(actualTableName, actualSchema, actualSchema);
-        sseEmit(res, 'progress', {
-            message: `✅ Dataset ready — ID: ${supersetDataset.id}, ${supersetDataset.columns.length} columns.`,
-            step: 2, total: totalSteps,
-        });
+        // Step 2: Fetch or auto-create Superset dataset(s)
+        const isMultiSource = Array.isArray(datasetInfo?._tables) && datasetInfo._tables.length > 1;
 
-        // Step 3: Build charts
+        // datasetMap: tableName → supersetDataset (for multi-source)
+        // singleDataset: the one dataset (for single-source)
+        let singleDataset = null;
+        const datasetMap = new Map(); // tableName → supersetDataset
+
+        if (isMultiSource) {
+            sseEmit(res, 'progress', {
+                message: `📊 Looking up ${datasetInfo._tables.length} Superset datasets…`,
+                step: 2, total: totalSteps,
+            });
+            for (const t of datasetInfo._tables) {
+                const ds = await client.getOrCreateDataset(t.name, t.db, t.db);
+                datasetMap.set(t.name, ds);
+                sseEmit(res, 'progress', {
+                    message: `  ✅ ${t.name} — ID: ${ds.id}, ${ds.columns.length} cols`,
+                    step: 2, total: totalSteps,
+                });
+            }
+        } else {
+            const actualTableName = datasetInfo?.table_name || dataset_name;
+            const actualSchema    = datasetInfo?.db_name || '';
+            sseEmit(res, 'progress', {
+                message: `📊 Looking up Superset dataset: "${actualTableName}"...`,
+                step: 2, total: totalSteps,
+            });
+            singleDataset = await client.getOrCreateDataset(actualTableName, actualSchema, actualSchema);
+            sseEmit(res, 'progress', {
+                message: `✅ Dataset ready — ID: ${singleDataset.id}, ${singleDataset.columns.length} columns.`,
+                step: 2, total: totalSteps,
+            });
+        }
+
+        // Step 3: Build charts — route each chart to its correct dataset
         sseEmit(res, 'progress', {
             message: `🎨 Building ${plan.charts.length} chart(s)...`,
             step: 3, total: totalSteps,
         });
-        const existingCharts = await client.getChartsForDataset(supersetDataset.id);
+
+        const knownTableNames = new Set(datasetMap.keys());
+        // Cache getChartsForDataset per dataset id to avoid repeated API calls
+        const existingChartsCache = new Map();
+        const getExisting = async (dsId) => {
+            if (!existingChartsCache.has(dsId)) {
+                existingChartsCache.set(dsId, await client.getChartsForDataset(dsId));
+            }
+            return existingChartsCache.get(dsId);
+        };
+
+        // For single-source, pre-fetch existing charts once
+        if (!isMultiSource) {
+            existingChartsCache.set(singleDataset.id, await client.getChartsForDataset(singleDataset.id));
+        }
+
         const chartActions = [];
         const chartIds = [];
 
         for (let i = 0; i < plan.charts.length; i++) {
-            const chartSpec = plan.charts[i];
+            const rawSpec = plan.charts[i];
+
+            let targetDataset, chartSpec;
+            if (isMultiSource) {
+                // Detect which table this chart belongs to and strip prefixes
+                const detectedTable = detectChartTable(rawSpec, knownTableNames);
+                targetDataset = detectedTable
+                    ? datasetMap.get(detectedTable)
+                    : datasetMap.values().next().value; // fallback to first table
+                chartSpec = dequalifyChart(rawSpec);
+
+                // Filter chart columns to only those actually in the target Superset dataset
+                // Prevents "Column cannot be resolved" errors from cross-table references
+                chartSpec = filterChartToDataset(chartSpec, targetDataset.columns);
+                if (!chartSpec) {
+                    sseEmit(res, 'progress', {
+                        message: `  ⚠ [${i + 1}/${plan.charts.length}] ${rawSpec.title} — skipped (no valid columns in target dataset)`,
+                        step: 3, total: totalSteps,
+                    });
+                    continue;
+                }
+            } else {
+                targetDataset = singleDataset;
+                chartSpec = rawSpec;
+            }
+
+            // If a time-series viz has no time_column (stripped or unavailable),
+            // downgrade to categorical bar (if dataset has a datetime col) or pie (if not).
+            // echarts_timeseries_bar also requires main_dttm_col at the dataset level, so
+            // when the dataset has NO datetime column we must fall back to pie instead.
+            const TIME_SERIES_REQUIRES_DTTM = new Set([
+                'echarts_timeseries_line','echarts_timeseries_smooth','echarts_timeseries_step',
+                'echarts_area','waterfall','rose',
+            ]);
+            const targetDatasetHasDttm = targetDataset.columns.some(c => c.is_dttm || c.type === 'DATETIME');
+            if (!chartSpec.time_column && TIME_SERIES_REQUIRES_DTTM.has(chartSpec.viz_type)) {
+                chartSpec = { ...chartSpec, viz_type: targetDatasetHasDttm ? 'echarts_timeseries_bar' : 'pie' };
+            }
+            // echarts_timeseries_bar also needs main_dttm_col set on the dataset
+            if (chartSpec.viz_type === 'echarts_timeseries_bar' && !chartSpec.time_column && !targetDatasetHasDttm) {
+                chartSpec = { ...chartSpec, viz_type: 'pie' };
+            }
+
             sseEmit(res, 'progress', {
                 message: `  → [${i + 1}/${plan.charts.length}] ${chartSpec.title} (${chartSpec.viz_type})`,
                 step: 3, total: totalSteps,
             });
-            const { id, action } = await client.upsertChart(supersetDataset.id, chartSpec, existingCharts);
+
+            const existing = await getExisting(targetDataset.id);
+            const { id, action } = await client.upsertChart(targetDataset.id, chartSpec, existing);
             chartIds.push(id);
             chartActions.push([id, action]);
         }
@@ -747,6 +1047,9 @@ router.post('/build', async (req, res) => {
             message: `✅ ${chartIds.length} chart(s) built.`,
             step: 3, total: totalSteps,
         });
+
+        // Use first dataset as the primary for filters and QA
+        const supersetDataset = singleDataset || datasetMap.values().next().value;
 
         // Step 4: Build position layout
         sseEmit(res, 'progress', {
@@ -775,14 +1078,43 @@ router.post('/build', async (req, res) => {
             step: 5, total: totalSteps,
         });
 
-        // Step 6: Set native filters
-        if (plan.filters?.length) {
+        // Step 6: Set native filters — route each filter to the dataset that owns its column
+        const validFilters = (plan.filters || []).filter(f => {
+            if (!isMultiSource) return true;
+            // For multi-source: strip table prefix before comparing against Superset column names
+            const bare = stripPrefix(f.column_name);
+            return [...datasetMap.values()].some(ds =>
+                ds.columns.some(c => (c.column_name || c.name || '').toLowerCase() === bare.toLowerCase())
+            );
+        });
+
+        if (validFilters.length) {
             sseEmit(res, 'progress', {
-                message: `🔧 Setting ${plan.filters.length} native filter(s)...`,
+                message: `🔧 Setting ${validFilters.length} native filter(s)...`,
                 step: 6, total: totalSteps,
             });
             try {
-                await client.setDashboardFilters(dashboardResult.id, plan.filters, supersetDataset.id);
+                // For multi-source: find the correct dataset for each filter.
+                // Strip table prefix before comparing — plan columns may be prefixed (e.g. "time_entries.spent_on")
+                // but Superset dataset columns are unprefixed.
+                const filterDatasetId = (filterCol) => {
+                    if (!isMultiSource) return supersetDataset.id;
+                    const bare = stripPrefix(filterCol);
+                    for (const ds of datasetMap.values()) {
+                        if (ds.columns.some(c => (c.column_name || c.name || '').toLowerCase() === bare.toLowerCase())) {
+                            return ds.id;
+                        }
+                    }
+                    return supersetDataset.id; // fallback
+                };
+
+                const filtersWithDataset = validFilters.map(f => ({
+                    ...f,
+                    column_name: stripPrefix(f.column_name), // always send unqualified name to Superset
+                    _dataset_id: filterDatasetId(f.column_name),
+                }));
+
+                await client.setDashboardFilters(dashboardResult.id, filtersWithDataset, supersetDataset.id);
                 sseEmit(res, 'progress', { message: '✅ Filters applied.', step: 6, total: totalSteps });
             } catch (filterErr) {
                 sseEmit(res, 'progress', {
@@ -819,6 +1151,7 @@ router.post('/build', async (req, res) => {
         console.error('[DataWizz Build Error]:', e.message);
         sseEmit(res, 'error', { message: e.message });
     } finally {
+        clearInterval(heartbeat);
         res.end();
     }
 });

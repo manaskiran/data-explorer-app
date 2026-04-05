@@ -1,6 +1,34 @@
-import { useState, useEffect, useRef, useCallback } from 'react';
+import { useState, useEffect, useRef, useCallback, Component } from 'react';
 import { useNavigate } from 'react-router-dom';
 import api, { API } from '../utils/api';
+
+// ── Error boundary — catches React render crashes so the page never goes blank ─
+class ErrorBoundary extends Component {
+    constructor(props) { super(props); this.state = { error: null }; }
+    static getDerivedStateFromError(e) { return { error: e }; }
+    render() {
+        if (this.state.error) {
+            return (
+                <div className="flex items-center justify-center h-screen bg-[#f4f7fa]">
+                    <div className="bg-white border border-red-200 rounded-2xl p-8 max-w-md text-center shadow-sm">
+                        <div className="w-12 h-12 bg-red-100 rounded-2xl flex items-center justify-center mx-auto mb-4">
+                            <i className="fas fa-exclamation-triangle text-red-500 text-lg"></i>
+                        </div>
+                        <h2 className="text-gray-800 font-bold text-base mb-2">Something went wrong</h2>
+                        <p className="text-gray-500 text-sm mb-4">{this.state.error?.message || 'An unexpected error occurred.'}</p>
+                        <button
+                            onClick={() => this.setState({ error: null })}
+                            className="bg-emerald-600 hover:bg-emerald-700 text-white font-bold px-5 py-2 rounded-xl text-sm transition-all"
+                        >
+                            Try again
+                        </button>
+                    </div>
+                </div>
+            );
+        }
+        return this.props.children;
+    }
+}
 
 // ── SSE over GET ──────────────────────────────────────────────────────────────
 function useSSE() {
@@ -110,6 +138,29 @@ function StepPill({ n, label, active, done, onClick }) {
 }
 
 // ── Chart Card ────────────────────────────────────────────────────────────────
+// Safe stringify: converts objects/arrays from LLM to readable strings so React never crashes
+const safeStr = (v) => {
+    if (v == null) return '';
+    if (typeof v === 'string') return v;
+    if (typeof v === 'number' || typeof v === 'boolean') return String(v);
+    return JSON.stringify(v);
+};
+
+// Format a QA issue/suggestion that may be a string or an LLM-returned object
+// e.g. {chart_title, issue, details} → "[Chart] Issue — Details"
+const fmtQA = (v) => {
+    if (v == null) return '';
+    if (typeof v === 'string') return v;
+    if (typeof v === 'object') {
+        const parts = [];
+        if (v.chart_title) parts.push(`[${v.chart_title}]`);
+        if (v.issue || v.message) parts.push(v.issue || v.message);
+        if (v.details) parts.push(v.details);
+        return parts.join(' — ') || JSON.stringify(v);
+    }
+    return String(v);
+};
+
 function ChartCard({ chart }) {
     const VIZ = {
         big_number_total:       { icon: 'fa-hashtag',    color: 'text-emerald-600', bg: 'bg-emerald-50 border-emerald-200' },
@@ -121,7 +172,7 @@ function ChartCard({ chart }) {
         echarts_scatter:        { icon: 'fa-braille',    color: 'text-amber-600',   bg: 'bg-amber-50 border-amber-200'     },
     };
     const v = VIZ[chart.viz_type] || { icon: 'fa-chart-area', color: 'text-gray-500', bg: 'bg-gray-50 border-gray-200' };
-    const metrics = (chart.metrics || []).map(m => m.label || `${m.aggregate}(${m.column?.column_name})`);
+    const metrics = (chart.metrics || []).map(m => safeStr(m.label || `${m.aggregate}(${m.column?.column_name})`));
 
     return (
         <div className="bg-white border border-gray-200 rounded-2xl p-4 hover:border-emerald-200 hover:shadow-sm transition-all">
@@ -131,13 +182,13 @@ function ChartCard({ chart }) {
                 </div>
                 <div className="flex-1 min-w-0">
                     <div className="flex items-center justify-between gap-2 mb-0.5">
-                        <h4 className="text-gray-800 text-sm font-bold truncate">{chart.title}</h4>
+                        <h4 className="text-gray-800 text-sm font-bold truncate">{safeStr(chart.title)}</h4>
                         <span className="text-[9px] font-bold bg-gray-100 text-gray-400 px-1.5 py-0.5 rounded uppercase tracking-wider shrink-0">w{chart.width}</span>
                     </div>
-                    <p className={`text-[10px] font-bold uppercase tracking-widest mb-1.5 ${v.color}`}>{chart.viz_type}</p>
+                    <p className={`text-[10px] font-bold uppercase tracking-widest mb-1.5 ${v.color}`}>{safeStr(chart.viz_type)}</p>
                     {metrics.length > 0 && <p className="text-[11px] text-gray-500"><span className="text-gray-600">Metrics:</span> {metrics.join(', ')}</p>}
-                    {chart.groupby?.length > 0 && <p className="text-[11px] text-gray-500"><span className="text-gray-600">Group by:</span> {chart.groupby.join(', ')}</p>}
-                    {chart.reasoning && <p className="text-[10px] text-gray-400 mt-1.5 italic leading-relaxed">{chart.reasoning}</p>}
+                    {chart.groupby?.length > 0 && <p className="text-[11px] text-gray-500"><span className="text-gray-600">Group by:</span> {chart.groupby.map(safeStr).join(', ')}</p>}
+                    {chart.reasoning && <p className="text-[10px] text-gray-400 mt-1.5 italic leading-relaxed">{safeStr(chart.reasoning)}</p>}
                 </div>
             </div>
         </div>
@@ -159,22 +210,20 @@ function Field({ label, hint, children }) {
 const INPUT = "w-full bg-gray-50 border border-gray-200 text-gray-800 placeholder-gray-400 px-4 py-2.5 rounded-xl focus:outline-none focus:border-emerald-400 focus:ring-2 focus:ring-emerald-100 transition-all text-sm font-medium";
 const SELECT = "w-full bg-gray-50 border border-gray-200 text-gray-800 px-4 py-2.5 rounded-xl focus:outline-none focus:border-emerald-400 focus:ring-2 focus:ring-emerald-100 transition-all text-sm font-medium disabled:opacity-40 appearance-none cursor-pointer";
 
+// ── Blank source factory ──────────────────────────────────────────────────────
+function makeSource(id) {
+    return { id, connId: '', conn: null, databases: [], db: '', tables: [], table: '', loadingDbs: false, loadingTables: false, schema: null, loadingSchema: false };
+}
+
 // ── Main Component ────────────────────────────────────────────────────────────
-export default function DataWizz() {
+function DataWizzInner() {
     const navigate = useNavigate();
     const [step, setStep] = useState(1);
 
-    // Step 1 — source
+    // Step 1 — multi-source
     const [connections, setConnections] = useState([]);
-    const [selConn, setSelConn] = useState(null);
-    const [databases, setDatabases] = useState([]);
-    const [selDb, setSelDb] = useState('');
-    const [tables, setTables] = useState([]);
-    const [selTable, setSelTable] = useState('');
-    const [schemaInfo, setSchemaInfo] = useState(null);
-    const [loadingDbs, setLoadingDbs] = useState(false);
-    const [loadingTables, setLoadingTables] = useState(false);
-    const [loadingSchema, setLoadingSchema] = useState(false);
+    const [sources, setSources] = useState([makeSource(1)]);
+    const nextSrcId = useRef(2);
 
     // Step 2 — config
     const [dashboardTitle, setDashboardTitle] = useState('');
@@ -220,37 +269,54 @@ export default function DataWizz() {
         navigate('/login', { replace: true });
     };
 
-    // ── Handlers ──────────────────────────────────────────────────────────────
+    // ── Multi-source handlers ─────────────────────────────────────────────────
 
-    const handleConnChange = async (connId) => {
-        const conn = connections.find(c => c.id.toString() === connId);
-        setSelConn(conn || null); setSelDb(''); setSelTable('');
-        setDatabases([]); setTables([]); setSchemaInfo(null);
+    const patchSource = (id, patch) =>
+        setSources(prev => prev.map(s => s.id === id ? { ...s, ...patch } : s));
+
+    const addSource = () => {
+        setSources(prev => [...prev, makeSource(nextSrcId.current++)]);
+    };
+
+    const removeSource = (id) => {
+        setSources(prev => prev.length > 1 ? prev.filter(s => s.id !== id) : prev);
+    };
+
+    const handleSrcConnChange = async (id, connId) => {
+        const conn = connections.find(c => c.id.toString() === connId) || null;
+        patchSource(id, { connId, conn, db: '', table: '', databases: [], tables: [], schema: null, loadingDbs: !!conn });
         if (!conn) return;
-        setLoadingDbs(true);
-        try { const r = await api.post(`${API}/explore/fetch`, { id: conn.id, type: 'databases' }); setDatabases(r.data); } catch { }
-        setLoadingDbs(false);
-    };
-
-    const handleDbChange = async (db) => {
-        setSelDb(db); setSelTable(''); setTables([]); setSchemaInfo(null);
-        if (!db || !selConn) return;
-        setLoadingTables(true);
-        try { const r = await api.post(`${API}/explore/fetch`, { id: selConn.id, type: 'tables', db }); setTables(r.data); } catch { }
-        setLoadingTables(false);
-    };
-
-    const handleTableChange = async (tName) => {
-        setSelTable(tName); setSchemaInfo(null);
-        if (!tName || !selConn || !selDb) return;
-        if (!datasetName) setDatasetName(tName);
-        setLoadingSchema(true);
         try {
-            const r = await api.post(`${API}/datawizz/schema`, { connection_id: selConn.id, db_name: selDb, table_name: tName });
-            setSchemaInfo(r.data);
-        } catch (e) { setSchemaInfo({ error: e.response?.data?.error || e.message }); }
-        setLoadingSchema(false);
+            const r = await api.post(`${API}/explore/fetch`, { id: conn.id, type: 'databases' });
+            patchSource(id, { databases: r.data, loadingDbs: false });
+        } catch { patchSource(id, { loadingDbs: false }); }
     };
+
+    const handleSrcDbChange = async (id, db) => {
+        // read conn from current state snapshot
+        const src = sources.find(s => s.id === id);
+        patchSource(id, { db, table: '', tables: [], schema: null, loadingTables: !!db });
+        if (!db || !src?.conn) return;
+        try {
+            const r = await api.post(`${API}/explore/fetch`, { id: src.conn.id, type: 'tables', db });
+            patchSource(id, { tables: r.data, loadingTables: false });
+        } catch { patchSource(id, { loadingTables: false }); }
+    };
+
+    const handleSrcTableChange = async (id, table) => {
+        const src = sources.find(s => s.id === id);
+        patchSource(id, { table, schema: null, loadingSchema: !!table });
+        if (!table || !src?.conn || !src?.db) return;
+        if (!datasetName) setDatasetName(table);
+        try {
+            const r = await api.post(`${API}/datawizz/schema`, { connection_id: src.conn.id, db_name: src.db, table_name: table });
+            patchSource(id, { schema: r.data, loadingSchema: false });
+        } catch (e) {
+            patchSource(id, { schema: { error: e.response?.data?.error || e.message }, loadingSchema: false });
+        }
+    };
+
+    // ── Superset ──────────────────────────────────────────────────────────────
 
     const testSuperset = async () => {
         setTestingSuperset(true); setSupersetStatus(null); setSupersetError('');
@@ -267,9 +333,13 @@ export default function DataWizz() {
 
     const runPlan = () => {
         setDashboardPlan(null); setPlanDatasetInfo(null); setStep(3);
+        const validSources = sources.filter(s => s.conn && s.db && s.table && s.schema && !s.schema?.error);
+        const sourcesParam = validSources.map(s => ({ connection_id: s.conn.id, db_name: s.db, table_name: s.table }));
+        const title = dashboardTitle || validSources.map(s => s.table).join(' + ');
         const params = new URLSearchParams({
-            connection_id: selConn.id, db_name: selDb, table_name: selTable,
-            dashboard_title: dashboardTitle || selTable, requirements,
+            sources: JSON.stringify(sourcesParam),
+            dashboard_title: title,
+            requirements,
         });
         planSSE.start(`${API}/datawizz/plan?${params}`);
     };
@@ -318,16 +388,27 @@ export default function DataWizz() {
     };
 
     // ── Derived state ─────────────────────────────────────────────────────────
-    const canStep2 = selConn && selDb && selTable && schemaInfo && !schemaInfo?.error;
+    const validSources = sources.filter(s => s.conn && s.db && s.table && s.schema && !s.schema?.error);
+    const canStep2 = validSources.length > 0;
     const canStep3 = canStep2 && requirements.trim() && datasetName.trim() && supersetUrl && supersetUser && supersetPass;
     const canBuild = dashboardPlan && !buildStreaming;
 
+    const allTablesBreadcrumb = validSources.map(s => `${s.db}.${s.table}`).join(' + ');
+
     const STEPS = [
-        { n: 1, label: 'Data Source',   done: step > 1 },
+        { n: 1, label: 'Data Sources',  done: step > 1 },
         { n: 2, label: 'Configure',     done: step > 2 },
         { n: 3, label: 'Generate Plan', done: step > 3 },
         { n: 4, label: 'Build',         done: !!buildResult },
     ];
+
+    const resetAll = () => {
+        setSources([makeSource(1)]);
+        nextSrcId.current = 2;
+        setDashboardPlan(null); setBuildResult(null); setBuildLogs([]);
+        setDashboardTitle(''); setRequirements(''); setDatasetName('');
+        setStep(1);
+    };
 
     // ── Layout ────────────────────────────────────────────────────────────────
     return (
@@ -374,6 +455,21 @@ export default function DataWizz() {
                             />
                         ))}
                     </div>
+
+                    {/* Source summary in sidebar */}
+                    {validSources.length > 0 && (
+                        <div className="mt-6 px-1">
+                            <p className="text-[10px] font-bold text-gray-400 uppercase tracking-widest px-2 mb-2">Selected Tables</p>
+                            <div className="space-y-1.5">
+                                {validSources.map(s => (
+                                    <div key={s.id} className="bg-white border border-gray-200 rounded-lg px-3 py-2">
+                                        <p className="text-[10px] font-bold text-emerald-600 truncate">{s.table}</p>
+                                        <p className="text-[9px] text-gray-400 truncate">{s.conn?.name} / {s.db}</p>
+                                    </div>
+                                ))}
+                            </div>
+                        </div>
+                    )}
                 </div>
 
                 {/* User + logout */}
@@ -406,12 +502,12 @@ export default function DataWizz() {
                 <header className="bg-white border-b border-gray-200 px-8 py-4 flex items-center justify-between shrink-0">
                     <div>
                         <h1 className="text-lg font-extrabold text-gray-800">
-                            {['', 'Select Data Source', 'Configure Dashboard', 'AI Dashboard Plan', 'Build Dashboard'][step]}
+                            {['', 'Select Data Sources', 'Configure Dashboard', 'AI Dashboard Plan', 'Build Dashboard'][step]}
                         </h1>
-                        {selTable && (
+                        {allTablesBreadcrumb && (
                             <p className="text-xs text-gray-500 mt-0.5 font-mono">
                                 <i className="fas fa-database mr-1.5 text-emerald-500"></i>
-                                {selDb}.{selTable}
+                                {allTablesBreadcrumb}
                             </p>
                         )}
                     </div>
@@ -431,110 +527,170 @@ export default function DataWizz() {
 
                         {/* ════════════════ STEP 1 ════════════════ */}
                         {step === 1 && (
-                            <div className="space-y-6">
-                                <div className="bg-white rounded-2xl shadow-sm border border-gray-200 p-6 space-y-5">
-                                    <div>
-                                        <h2 className="text-base font-bold text-gray-800 mb-1">Choose Connection</h2>
-                                        <p className="text-sm text-gray-500">Pick the table you want to build a dashboard for.</p>
-                                    </div>
-                                    <div className="grid grid-cols-3 gap-4">
-                                        <Field label="Connection">
-                                            <div className="relative">
-                                                <select value={selConn?.id || ''} onChange={e => handleConnChange(e.target.value)} className={SELECT}>
-                                                    <option value="" className="bg-white text-gray-800">— pick one —</option>
-                                                    {connections.map(c => <option key={c.id} value={c.id} className="bg-white text-gray-800">{c.name}</option>)}
-                                                </select>
-                                                <i className="fas fa-chevron-down absolute right-3 top-3.5 text-gray-400 text-xs pointer-events-none"></i>
-                                            </div>
-                                        </Field>
-                                        <Field label="Database">
-                                            <div className="relative">
-                                                <select value={selDb} onChange={e => handleDbChange(e.target.value)} disabled={!selConn || loadingDbs} className={SELECT}>
-                                                    <option value="" className="bg-white text-gray-800">— pick one —</option>
-                                                    {databases.map(db => <option key={db} value={db} className="bg-white text-gray-800">{db}</option>)}
-                                                </select>
-                                                <i className="fas fa-chevron-down absolute right-3 top-3.5 text-gray-400 text-xs pointer-events-none"></i>
-                                            </div>
-                                            {loadingDbs && <p className="text-[10px] text-emerald-500 mt-1"><i className="fas fa-spinner fa-spin mr-1"></i>Loading…</p>}
-                                        </Field>
-                                        <Field label="Table">
-                                            <div className="relative">
-                                                <select value={selTable} onChange={e => handleTableChange(e.target.value)} disabled={!selDb || loadingTables} className={SELECT}>
-                                                    <option value="" className="bg-white text-gray-800">— pick one —</option>
-                                                    {tables.map(t => <option key={t} value={t} className="bg-white text-gray-800">{t}</option>)}
-                                                </select>
-                                                <i className="fas fa-chevron-down absolute right-3 top-3.5 text-gray-400 text-xs pointer-events-none"></i>
-                                            </div>
-                                            {loadingTables && <p className="text-[10px] text-emerald-500 mt-1"><i className="fas fa-spinner fa-spin mr-1"></i>Loading…</p>}
-                                        </Field>
+                            <div className="space-y-4">
+                                <div className="bg-white rounded-2xl shadow-sm border border-gray-200 p-6">
+                                    <div className="mb-5">
+                                        <h2 className="text-base font-bold text-gray-800 mb-1">Choose Data Sources</h2>
+                                        <p className="text-sm text-gray-500">Add one or more tables to build a multi-source BI dashboard.</p>
                                     </div>
 
-                                    {/* Schema preview */}
-                                    {loadingSchema && (
-                                        <div className="flex items-center gap-2 text-emerald-600 text-sm">
-                                            <span className="w-2 h-2 bg-emerald-500 rounded-full animate-pulse"></span>
-                                            Fetching schema and metadata…
-                                        </div>
-                                    )}
-
-                                    {schemaInfo && !schemaInfo.error && (
-                                        <div>
-                                            <div className="flex items-center justify-between mb-3">
-                                                <p className="text-sm font-bold text-gray-600">
-                                                    <i className="fas fa-table mr-2 text-emerald-500"></i>
-                                                    {schemaInfo.columns?.length} columns detected
-                                                </p>
-                                                {schemaInfo.description && (
-                                                    <span className="text-[10px] bg-amber-50 text-amber-600 border border-amber-200 px-2 py-0.5 rounded-full font-bold">
-                                                        <i className="fas fa-book-open mr-1"></i>metadata enriched
+                                    <div className="space-y-4">
+                                        {sources.map((src, idx) => (
+                                            <div key={src.id} className="border border-gray-200 rounded-xl p-4 bg-gray-50 space-y-4">
+                                                {/* Row header */}
+                                                <div className="flex items-center justify-between">
+                                                    <span className="text-xs font-bold text-gray-500 uppercase tracking-widest">
+                                                        Source {idx + 1}
+                                                        {src.table && <span className="ml-2 text-emerald-600 normal-case font-semibold tracking-normal">· {src.table}</span>}
                                                     </span>
+                                                    {sources.length > 1 && (
+                                                        <button
+                                                            onClick={() => removeSource(src.id)}
+                                                            className="w-6 h-6 flex items-center justify-center rounded-lg text-gray-400 hover:bg-red-50 hover:text-red-500 transition-all"
+                                                            title="Remove source"
+                                                        >
+                                                            <i className="fas fa-times text-xs"></i>
+                                                        </button>
+                                                    )}
+                                                </div>
+
+                                                {/* Dropdowns */}
+                                                <div className="grid grid-cols-3 gap-3">
+                                                    <Field label="Connection">
+                                                        <div className="relative">
+                                                            <select
+                                                                value={src.connId}
+                                                                onChange={e => handleSrcConnChange(src.id, e.target.value)}
+                                                                className={SELECT}
+                                                            >
+                                                                <option value="" className="bg-white text-gray-800">— pick one —</option>
+                                                                {connections.map(c => <option key={c.id} value={c.id} className="bg-white text-gray-800">{c.name}</option>)}
+                                                            </select>
+                                                            <i className="fas fa-chevron-down absolute right-3 top-3.5 text-gray-400 text-xs pointer-events-none"></i>
+                                                        </div>
+                                                    </Field>
+                                                    <Field label="Database">
+                                                        <div className="relative">
+                                                            <select
+                                                                value={src.db}
+                                                                onChange={e => handleSrcDbChange(src.id, e.target.value)}
+                                                                disabled={!src.conn || src.loadingDbs}
+                                                                className={SELECT}
+                                                            >
+                                                                <option value="" className="bg-white text-gray-800">— pick one —</option>
+                                                                {src.databases.map(db => <option key={db} value={db} className="bg-white text-gray-800">{db}</option>)}
+                                                            </select>
+                                                            <i className="fas fa-chevron-down absolute right-3 top-3.5 text-gray-400 text-xs pointer-events-none"></i>
+                                                        </div>
+                                                        {src.loadingDbs && <p className="text-[10px] text-emerald-500 mt-1"><i className="fas fa-spinner fa-spin mr-1"></i>Loading…</p>}
+                                                    </Field>
+                                                    <Field label="Table">
+                                                        <div className="relative">
+                                                            <select
+                                                                value={src.table}
+                                                                onChange={e => handleSrcTableChange(src.id, e.target.value)}
+                                                                disabled={!src.db || src.loadingTables}
+                                                                className={SELECT}
+                                                            >
+                                                                <option value="" className="bg-white text-gray-800">— pick one —</option>
+                                                                {src.tables.map(t => <option key={t} value={t} className="bg-white text-gray-800">{t}</option>)}
+                                                            </select>
+                                                            <i className="fas fa-chevron-down absolute right-3 top-3.5 text-gray-400 text-xs pointer-events-none"></i>
+                                                        </div>
+                                                        {src.loadingTables && <p className="text-[10px] text-emerald-500 mt-1"><i className="fas fa-spinner fa-spin mr-1"></i>Loading…</p>}
+                                                    </Field>
+                                                </div>
+
+                                                {/* Schema loading indicator */}
+                                                {src.loadingSchema && (
+                                                    <div className="flex items-center gap-2 text-emerald-600 text-sm">
+                                                        <span className="w-2 h-2 bg-emerald-500 rounded-full animate-pulse"></span>
+                                                        Fetching schema and metadata…
+                                                    </div>
+                                                )}
+
+                                                {/* Schema error */}
+                                                {src.schema?.error && (
+                                                    <div className="bg-red-50 border border-red-200 rounded-xl p-3 text-red-600 text-sm flex items-center gap-2">
+                                                        <i className="fas fa-exclamation-circle shrink-0"></i> {src.schema.error}
+                                                    </div>
+                                                )}
+
+                                                {/* Schema preview */}
+                                                {src.schema && !src.schema.error && (
+                                                    <div>
+                                                        <div className="flex items-center justify-between mb-2">
+                                                            <p className="text-sm font-bold text-gray-600">
+                                                                <i className="fas fa-check-circle mr-2 text-emerald-500"></i>
+                                                                {src.schema.columns?.length} columns detected
+                                                            </p>
+                                                            {src.schema.description && (
+                                                                <span className="text-[10px] bg-amber-50 text-amber-600 border border-amber-200 px-2 py-0.5 rounded-full font-bold">
+                                                                    <i className="fas fa-book-open mr-1"></i>metadata enriched
+                                                                </span>
+                                                            )}
+                                                        </div>
+                                                        {src.schema.description && (
+                                                            <div className="mb-2 bg-amber-50 border border-amber-200 rounded-xl p-3 text-xs text-amber-700">
+                                                                {src.schema.description}
+                                                            </div>
+                                                        )}
+                                                        <div className="rounded-xl border border-gray-200 overflow-hidden">
+                                                            <div className="overflow-y-auto max-h-40">
+                                                                <table className="min-w-full">
+                                                                    <thead className="bg-gray-50 sticky top-0">
+                                                                        <tr>
+                                                                            <th className="px-4 py-2 text-left text-[10px] font-bold text-gray-500 uppercase tracking-wider">Column</th>
+                                                                            <th className="px-4 py-2 text-left text-[10px] font-bold text-gray-500 uppercase tracking-wider">Type</th>
+                                                                            <th className="px-4 py-2 text-left text-[10px] font-bold text-gray-500 uppercase tracking-wider">Description</th>
+                                                                        </tr>
+                                                                    </thead>
+                                                                    <tbody className="bg-white">
+                                                                        {src.schema.columns?.map((col, i) => {
+                                                                            const badge = {
+                                                                                NUMERIC:  'bg-emerald-50 text-emerald-700 border-emerald-200',
+                                                                                DATETIME: 'bg-violet-50 text-violet-700 border-violet-200',
+                                                                                STRING:   'bg-sky-50 text-sky-700 border-sky-200',
+                                                                            }[col.type] || 'bg-gray-50 text-gray-500 border-gray-200';
+                                                                            return (
+                                                                                <tr key={i} className="border-t border-gray-100 hover:bg-gray-50 transition-colors">
+                                                                                    <td className="px-4 py-2 font-mono text-xs text-gray-700">{col.column_name}</td>
+                                                                                    <td className="px-4 py-2">
+                                                                                        <span className={`text-[9px] font-bold px-2 py-0.5 rounded-full border ${badge}`}>{col.type}</span>
+                                                                                    </td>
+                                                                                    <td className="px-4 py-2 text-[11px] text-gray-400 italic">{safeStr(col.comment) || '—'}</td>
+                                                                                </tr>
+                                                                            );
+                                                                        })}
+                                                                    </tbody>
+                                                                </table>
+                                                            </div>
+                                                        </div>
+                                                    </div>
                                                 )}
                                             </div>
-                                            {schemaInfo.description && (
-                                                <div className="mb-3 bg-amber-50 border border-amber-200 rounded-xl p-3 text-xs text-amber-700">
-                                                    {schemaInfo.description}
-                                                </div>
-                                            )}
-                                            <div className="rounded-xl border border-gray-200 overflow-hidden">
-                                                <div className="overflow-y-auto max-h-52">
-                                                    <table className="min-w-full">
-                                                        <thead className="bg-gray-50 sticky top-0">
-                                                            <tr>
-                                                                <th className="px-4 py-2.5 text-left text-[10px] font-bold text-gray-500 uppercase tracking-wider">Column</th>
-                                                                <th className="px-4 py-2.5 text-left text-[10px] font-bold text-gray-500 uppercase tracking-wider">Type</th>
-                                                                <th className="px-4 py-2.5 text-left text-[10px] font-bold text-gray-500 uppercase tracking-wider">Description</th>
-                                                            </tr>
-                                                        </thead>
-                                                        <tbody className="bg-white">
-                                                            {schemaInfo.columns?.map((col, i) => {
-                                                                const badge = {
-                                                                    NUMERIC:  'bg-emerald-50 text-emerald-700 border-emerald-200',
-                                                                    DATETIME: 'bg-violet-50 text-violet-700 border-violet-200',
-                                                                    STRING:   'bg-sky-50 text-sky-700 border-sky-200',
-                                                                }[col.type] || 'bg-gray-50 text-gray-500 border-gray-200';
-                                                                return (
-                                                                    <tr key={i} className="border-t border-gray-100 hover:bg-gray-50 transition-colors">
-                                                                        <td className="px-4 py-2 font-mono text-xs text-gray-700">{col.column_name}</td>
-                                                                        <td className="px-4 py-2">
-                                                                            <span className={`text-[9px] font-bold px-2 py-0.5 rounded-full border ${badge}`}>{col.type}</span>
-                                                                        </td>
-                                                                        <td className="px-4 py-2 text-[11px] text-gray-400 italic">{col.comment || '—'}</td>
-                                                                    </tr>
-                                                                );
-                                                            })}
-                                                        </tbody>
-                                                    </table>
-                                                </div>
-                                            </div>
-                                        </div>
-                                    )}
+                                        ))}
+                                    </div>
 
-                                    {schemaInfo?.error && (
-                                        <div className="bg-red-50 border border-red-200 rounded-xl p-3 text-red-600 text-sm flex items-center gap-2">
-                                            <i className="fas fa-exclamation-circle shrink-0"></i> {schemaInfo.error}
-                                        </div>
-                                    )}
+                                    {/* Add source button */}
+                                    <button
+                                        onClick={addSource}
+                                        className="mt-4 w-full flex items-center justify-center gap-2 px-4 py-3 border-2 border-dashed border-gray-200 rounded-xl text-sm text-gray-400 hover:border-emerald-300 hover:text-emerald-600 hover:bg-emerald-50 transition-all font-semibold"
+                                    >
+                                        <i className="fas fa-plus text-xs"></i>
+                                        Add another data source
+                                    </button>
                                 </div>
+
+                                {/* Summary badge when multiple valid sources */}
+                                {validSources.length > 1 && (
+                                    <div className="bg-emerald-50 border border-emerald-200 rounded-xl px-4 py-3 flex items-center gap-3">
+                                        <i className="fas fa-layer-group text-emerald-600"></i>
+                                        <p className="text-sm text-emerald-700 font-medium">
+                                            <span className="font-bold">{validSources.length} tables</span> selected — AI will design a multi-source dashboard across all of them.
+                                        </p>
+                                    </div>
+                                )}
 
                                 <div className="flex justify-end">
                                     <button
@@ -555,19 +711,19 @@ export default function DataWizz() {
                                     <h3 className="text-sm font-bold text-gray-700 border-b border-gray-100 pb-3">Dashboard Settings</h3>
                                     <div className="grid grid-cols-2 gap-4">
                                         <Field label="Dashboard Title">
-                                            <input type="text" value={dashboardTitle} onChange={e => setDashboardTitle(e.target.value)} placeholder={`${selTable || 'My'} Dashboard`} className={INPUT} />
+                                            <input type="text" value={dashboardTitle} onChange={e => setDashboardTitle(e.target.value)} placeholder={`${validSources.map(s => s.table).join(' + ')} Dashboard`} className={INPUT} />
                                         </Field>
                                         <Field label="Superset Dataset Name" hint="(existing dataset in Superset)">
-                                            <input type="text" value={datasetName} onChange={e => setDatasetName(e.target.value)} placeholder={selTable} list="dw-datasets" className={INPUT} />
+                                            <input type="text" value={datasetName} onChange={e => setDatasetName(e.target.value)} placeholder={validSources[0]?.table || 'dataset'} list="dw-datasets" className={INPUT} />
                                             <datalist id="dw-datasets">{supersetDatasets.map(d => <option key={d.id} value={d.name} />)}</datalist>
                                         </Field>
                                     </div>
-                                    <Field label="Requirements" hint="(describe what charts you need)">
+                                    <Field label="Requirements" hint="(describe what charts you need across all selected tables)">
                                         <textarea
                                             value={requirements}
                                             onChange={e => setRequirements(e.target.value)}
                                             rows={5}
-                                            placeholder={"- Total revenue KPI\n- Monthly trend by region\n- Top 10 products (bar)\n- Revenue by category (pie)\n- Filter by date range"}
+                                            placeholder={"- Total revenue KPI\n- Monthly trend by region\n- Top 10 products (bar)\n- Revenue by category (pie)\n- Cross-table comparison"}
                                             className={`${INPUT} resize-none`}
                                         />
                                     </Field>
@@ -646,8 +802,8 @@ export default function DataWizz() {
                                                 <i className="fas fa-check text-white text-sm"></i>
                                             </div>
                                             <div>
-                                                <p className="font-extrabold text-gray-800 text-base">{dashboardPlan.dashboard_title}</p>
-                                                <p className="text-gray-500 text-sm mt-0.5">{dashboardPlan.reasoning}</p>
+                                                <p className="font-extrabold text-gray-800 text-base">{safeStr(dashboardPlan.dashboard_title)}</p>
+                                                <p className="text-gray-500 text-sm mt-0.5">{safeStr(dashboardPlan.reasoning)}</p>
                                             </div>
                                         </div>
 
@@ -666,7 +822,7 @@ export default function DataWizz() {
                                                 <div className="flex flex-wrap gap-2">
                                                     {dashboardPlan.filters.map((f, i) => (
                                                         <span key={i} className="bg-indigo-50 border border-indigo-200 text-indigo-700 text-xs font-bold px-3 py-1.5 rounded-xl">
-                                                            <i className="fas fa-filter mr-1.5 text-[9px]"></i>{f.label} · {f.filter_type}
+                                                            <i className="fas fa-filter mr-1.5 text-[9px]"></i>{safeStr(f.label)} · {safeStr(f.filter_type)}
                                                         </span>
                                                     ))}
                                                 </div>
@@ -728,19 +884,23 @@ export default function DataWizz() {
                                         </div>
 
                                         {/* Charts built */}
-                                        {buildResult.chartActions?.length > 0 && (
+                                        {Array.isArray(buildResult.chartActions) && buildResult.chartActions.length > 0 && (
                                             <div className="bg-white rounded-2xl shadow-sm border border-gray-200 p-5">
                                                 <p className="text-sm font-bold text-gray-500 uppercase tracking-widest mb-4">Charts built ({buildResult.chartActions.length})</p>
                                                 <div className="space-y-2">
-                                                    {buildResult.chartActions.map(([id, action], i) => (
+                                                    {buildResult.chartActions.map((entry, i) => {
+                                                        const id = Array.isArray(entry) ? entry[0] : entry;
+                                                        const action = Array.isArray(entry) ? entry[1] : 'created';
+                                                        return (
                                                         <div key={i} className="flex items-center gap-3 text-xs">
                                                             <span className={`font-bold px-2 py-0.5 rounded-lg ${action === 'created' ? 'bg-emerald-50 text-emerald-700 border border-emerald-200' : 'bg-sky-50 text-sky-700 border border-sky-200'}`}>
                                                                 {action}
                                                             </span>
                                                             <span className="font-mono text-gray-400">#{id}</span>
-                                                            {dashboardPlan?.charts?.[i] && <span className="text-gray-600 font-medium">{dashboardPlan.charts[i].title}</span>}
+                                                            {dashboardPlan?.charts?.[i]?.title && <span className="text-gray-600 font-medium">{safeStr(dashboardPlan.charts[i].title)}</span>}
                                                         </div>
-                                                    ))}
+                                                        );
+                                                    })}
                                                 </div>
                                             </div>
                                         )}
@@ -750,16 +910,16 @@ export default function DataWizz() {
                                             <div className={`border rounded-2xl p-5 ${buildResult.qaReport.passed ? 'bg-emerald-50 border-emerald-200' : 'bg-amber-50 border-amber-200'}`}>
                                                 <p className={`text-sm font-bold uppercase tracking-widest mb-3 flex items-center gap-2 ${buildResult.qaReport.passed ? 'text-emerald-700' : 'text-amber-700'}`}>
                                                     <i className={`fas ${buildResult.qaReport.passed ? 'fa-shield-check' : 'fa-exclamation-triangle'} text-xs`}></i>
-                                                    QA Review {buildResult.qaReport.passed ? 'Passed' : `— ${buildResult.qaReport.issues.length} issue(s)`}
+                                                    QA Review {buildResult.qaReport.passed ? 'Passed' : `— ${(buildResult.qaReport.issues || []).length} issue(s)`}
                                                 </p>
-                                                {buildResult.qaReport.issues.map((issue, i) => (
+                                                {(buildResult.qaReport.issues || []).map((issue, i) => (
                                                     <p key={i} className="text-xs text-amber-700 flex items-start gap-1.5 mb-1.5">
-                                                        <i className="fas fa-times-circle mt-0.5 shrink-0"></i>{issue}
+                                                        <i className="fas fa-times-circle mt-0.5 shrink-0"></i>{fmtQA(issue)}
                                                     </p>
                                                 ))}
-                                                {buildResult.qaReport.suggestions.map((s, i) => (
+                                                {(buildResult.qaReport.suggestions || []).map((s, i) => (
                                                     <p key={i} className="text-xs text-gray-500 flex items-start gap-1.5 mb-1.5">
-                                                        <i className="fas fa-lightbulb text-amber-500 mt-0.5 shrink-0"></i>{s}
+                                                        <i className="fas fa-lightbulb text-amber-500 mt-0.5 shrink-0"></i>{fmtQA(s)}
                                                     </p>
                                                 ))}
                                             </div>
@@ -772,7 +932,7 @@ export default function DataWizz() {
                                         <i className="fas fa-arrow-left text-xs"></i> Back to Plan
                                     </button>
                                     <button
-                                        onClick={() => { setStep(1); setDashboardPlan(null); setBuildResult(null); setBuildLogs([]); setSchemaInfo(null); setSelTable(''); setSelDb(''); setSelConn(null); }}
+                                        onClick={resetAll}
                                         className="text-gray-500 hover:text-gray-800 border border-gray-200 hover:border-gray-300 bg-white font-bold px-6 py-2.5 rounded-xl flex items-center gap-2 transition-all text-sm"
                                     >
                                         <i className="fas fa-plus text-xs"></i> New Dashboard
@@ -786,4 +946,8 @@ export default function DataWizz() {
             </div>
         </div>
     );
+}
+
+export default function DataWizz() {
+    return <ErrorBoundary><DataWizzInner /></ErrorBoundary>;
 }
