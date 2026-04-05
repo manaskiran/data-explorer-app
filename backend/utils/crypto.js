@@ -40,4 +40,15 @@ function decrypt(text) {
     }
 }
 
-module.exports = { encrypt, decrypt };
+/**
+ * Returns { port, user, password } for a mysql.createConnection call.
+ * Hive connections use the embedded StarRocks FE port (9030) and sr_* credentials.
+ */
+function getConnConfig(conn) {
+    if (conn.type === 'starrocks') {
+        return { port: conn.port, user: conn.username, password: decrypt(conn.password) };
+    }
+    return { port: 9030, user: conn.sr_username || 'root', password: decrypt(conn.sr_password) || '' };
+}
+
+module.exports = { encrypt, decrypt, getConnConfig };

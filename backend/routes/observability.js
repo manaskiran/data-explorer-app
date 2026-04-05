@@ -1,4 +1,4 @@
-const express = require('express'); const router = express.Router(); const mysql = require('mysql2/promise'); const { pgPool } = require('../db'); const { decrypt } = require('../utils/crypto');
+const express = require('express'); const router = express.Router(); const mysql = require('mysql2/promise'); const { pgPool } = require('../db'); const { getConnConfig } = require('../utils/crypto');
 const { requireConnectionAccess } = require('../middleware/access');
 const isValidIdentifier = (name) => typeof name === 'string' && /^[a-zA-Z0-9_\-]+$/.test(name);
 
@@ -6,6 +6,7 @@ router.post('/webhook', async (req, res) => {
     try {
         const { db_name, table_name, total_count, today_count } = req.body;
         if (!db_name || !table_name) return res.status(400).json({ error: "Missing database or table name" });
+        if (!isValidIdentifier(db_name) || !isValidIdentifier(table_name)) return res.status(400).json({ error: "Invalid identifier format" });
 
         const targetDate = new Date().toISOString().slice(0, 10);
         const previous = Number(total_count) - Number(today_count);
@@ -43,7 +44,8 @@ router.post('/calculate', requireConnectionAccess('connection_id'), async (req, 
         const { connection_id, db_name, table_name } = req.body; const { rows } = await pgPool.query('SELECT * FROM explorer_connections WHERE id = $1', [connection_id]); if (!rows.length) return res.status(404).json({ error: 'Connection not found' }); const conn = rows[0]; if (!isValidIdentifier(db_name) || !isValidIdentifier(table_name)) return res.status(400).json({ error: "Invalid identifiers" });
         const todayStr = new Date().toISOString().slice(0, 10).replace(/-/g, ''); const targetDate = new Date().toISOString().slice(0, 10); 
         let total = 0, today = 0, previous = 0, typeStr = 'starrocks_standard';
-        const connection = await mysql.createConnection({ host: conn.host, port: conn.type === 'starrocks' ? conn.port : 9030, user: conn.type === 'starrocks' ? conn.username : (conn.sr_username || 'root'), password: conn.type === 'starrocks' ? decrypt(conn.password) : (decrypt(conn.sr_password) || '') });
+        const { port, user, password } = getConnConfig(conn);
+        const connection = await mysql.createConnection({ host: conn.host, port, user, password });
         try {
             if (conn.type === 'hive') await connection.query('SET CATALOG hudi_catalog;');
             let isHudi = false; try { const [schemaCols] = await connection.query(`DESCRIBE \`${db_name}\`.\`${table_name}\``); isHudi = schemaCols.some(c => c.Field === '_hoodie_record_key'); } catch(e) { console.warn('[Observability] Hudi check failed:', e.message); }

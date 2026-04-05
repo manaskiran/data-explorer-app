@@ -3,7 +3,6 @@ const express = require('express');
 const cors = require('cors');
 const helmet = require('helmet');
 const https = require('https');
-const http = require('http');
 const fs = require('fs');
 const compression = require('compression');
 const rateLimit = require('express-rate-limit');
@@ -40,8 +39,23 @@ process.on('unhandledRejection', (reason) => console.error('[CRITICAL] Unhandled
 // ─── App ──────────────────────────────────────────────────────────────────────
 const app = express();
 
-// Security headers
-app.use(helmet());
+// Security headers with explicit CSP and HSTS
+app.use(helmet({
+    contentSecurityPolicy: {
+        directives: {
+            defaultSrc:  ["'self'"],
+            scriptSrc:   ["'self'", "'unsafe-inline'", "cdnjs.cloudflare.com"],
+            styleSrc:    ["'self'", "'unsafe-inline'", "cdnjs.cloudflare.com", "fonts.googleapis.com"],
+            fontSrc:     ["'self'", "cdnjs.cloudflare.com", "fonts.gstatic.com"],
+            imgSrc:      ["'self'", "data:", "blob:"],
+            connectSrc:  ["'self'"],
+            frameSrc:    ["'none'"],
+            objectSrc:   ["'none'"],
+        },
+    },
+    hsts: { maxAge: 31536000, includeSubDomains: true, preload: true },
+    crossOriginEmbedderPolicy: false, // allow embedded Superset iframes
+}));
 
 // Gzip/Brotli compression for all responses
 app.use(compression());
@@ -69,6 +83,19 @@ app.use('/api/table-metadata/', rateLimit({
     windowMs: 15 * 60 * 1000,
     max: 100,
     message: { error: 'Too many metadata requests. Please try again later.' },
+    standardHeaders: true, legacyHeaders: false,
+}));
+// Strict rate limit for heavy export/build operations (max 5/hour per IP)
+app.use('/api/explore/export/', rateLimit({
+    windowMs: 60 * 60 * 1000,
+    max: 5,
+    message: { error: 'Export rate limit exceeded. Please wait before exporting again.' },
+    standardHeaders: true, legacyHeaders: false,
+}));
+app.use('/api/datawizz/build', rateLimit({
+    windowMs: 60 * 60 * 1000,
+    max: 10,
+    message: { error: 'Dashboard build rate limit exceeded. Please wait.' },
     standardHeaders: true, legacyHeaders: false,
 }));
 
@@ -248,8 +275,19 @@ const enforceAuth = (req, res, next) => {
     if (!token) return res.status(401).json({ error: 'Authentication token required.' });
     jwt.verify(token, process.env.JWT_SECRET, { algorithms: ['HS256'] }, (err, user) => {
         if (err) return res.status(403).json({ error: 'Invalid or expired token.' });
-        req.user = user;
-        next();
+        // Re-validate role from DB so revoked/demoted users are blocked immediately
+        pgPool.query('SELECT role FROM explorer_users WHERE username = $1', [user.username])
+            .then(({ rows }) => {
+                if (!rows.length) {
+                    return res.status(403).json({ error: 'Account not found.' });
+                }
+                req.user = { ...user, role: rows[0].role }; // always use DB role (not stale token role)
+                next();
+            })
+            .catch(() => {
+                req.user = user; // fallback to token role if DB unreachable
+                next();
+            });
     });
 };
 
@@ -310,6 +348,9 @@ const sslOptions = {
 };
 
 const server = https.createServer(sslOptions, app);
+// Disable server-level timeout so long-running SSE streams (DataWizz build) never get cut off
+server.timeout = 0;
+server.keepAliveTimeout = 65000; // slightly above any load-balancer idle timeout
 
 const shutdown = async (signal) => {
     console.log(`[INFO] ${signal} received — starting graceful shutdown...`);

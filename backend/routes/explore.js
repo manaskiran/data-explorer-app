@@ -3,10 +3,19 @@ const { maskDataPreview } = require('../utils/masking');
 const { requireConnectionAccess } = require('../middleware/access');
 const globalHiveCache = {};
 const HIVE_CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
+// Purge expired cache entries every 10 minutes to prevent unbounded memory growth
+setInterval(() => {
+    const now = Date.now();
+    for (const key of Object.keys(globalHiveCache)) {
+        if (now - (globalHiveCache[key]?.__ts || 0) > HIVE_CACHE_TTL_MS) delete globalHiveCache[key];
+    }
+}, 10 * 60 * 1000).unref();
 const isValidIdentifier = (name) => typeof name === 'string' && /^[a-zA-Z0-9_\-]+$/.test(name);
 
 async function setupHiveClient(conn) {
-    let client; const host = conn.host; const port = Number(conn.port) || 10000; const authUser = (conn.username && conn.username.trim() !== '') ? conn.username : 'hadoop'; const authPass = conn.password || 'dummy';
+    let client; const host = conn.host; const port = Number(conn.port) || 10000;
+    if (!conn.username || !conn.username.trim()) throw new Error('Hive connection requires a username');
+    const authUser = conn.username.trim(); const authPass = conn.password || '';
     client = new hive.HiveClient(TCLIService, TCLIService_types); client.on('error', () => {}); try { await client.connect({ host, port }, new hive.connections.TcpConnection(), new hive.auth.PlainTcpAuthentication({ username: authUser, password: authPass })); } catch (e) { client = new hive.HiveClient(TCLIService, TCLIService_types); client.on('error', () => {}); await client.connect({ host, port }, new hive.connections.TcpConnection(), new hive.auth.NoSaslAuthentication()); }
     const session = await client.openSession({ client_protocol: TCLIService_types.TProtocolVersion.HIVE_CLI_SERVICE_PROTOCOL_V10 }); const utils = new hive.HiveUtils(TCLIService_types);
     const executeQuery = async (query) => { const operation = await session.executeStatement(query); await utils.waitUntilReady(operation, false, () => {}); await utils.fetchAll(operation); const result = utils.getResult(operation).getValue(); await operation.close(); return result; };
@@ -102,11 +111,13 @@ router.post('/export/fetch', requireConnectionAccess('id'), async (req, res) => 
         } else {
             let setup = await setupHiveClient(conn);
             try {
-                const allCols = await Promise.race([ setup.executeQuery(`SELECT table_name, column_name, data_type, comment FROM information_schema.columns WHERE table_schema = '${req.body.db}'`), new Promise((_, r) => setTimeout(() => r(new Error("FAST_TIMEOUT")), 15000)) ]);
+                // isValidIdentifier already enforced above; use backtick quoting for Hive identifier safety
+                const safeDb = req.body.db.replace(/`/g, '');
+                const allCols = await Promise.race([ setup.executeQuery(`SELECT table_name, column_name, data_type, comment FROM information_schema.columns WHERE table_schema = \`${safeDb}\``), new Promise((_, r) => setTimeout(() => r(new Error("FAST_TIMEOUT")), 15000)) ]);
                 if (allCols && allCols.length > 0) { allCols.forEach(r => { const override = dbMeta[Object.values(r)[0]]?.[Object.values(r)[1]]; worksheet.addRow({ db: req.body.db, table: Object.values(r)[0], column: Object.values(r)[1], type: Object.values(r)[2] || '', comment: override || Object.values(r)[3] || '' }); }); }
             } catch (err) { console.warn('[Export] Hive info_schema query failed:', err.message); } finally { try{if(setup.session) await setup.session.close();}catch(e){ console.warn('[Export] Hive session close failed:', e.message); } try{if(setup.client) await setup.client.close();}catch(e){ console.warn('[Export] Hive client close failed:', e.message); } }
         }
-        res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'); res.setHeader('Content-Disposition', `attachment; filename="${req.body.db}_data_dictionary.xlsx"`);
+        res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'); res.setHeader('Content-Disposition', `attachment; filename="${encodeURIComponent(req.body.db)}_data_dictionary.xlsx"`);
         await workbook.xlsx.write(res); res.end();
     } catch (e) { console.error("[Export Error]:", e); res.status(500).json({ error: "Failed to generate Excel export." }); }
 });

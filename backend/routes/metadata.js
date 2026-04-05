@@ -1,4 +1,4 @@
-const express = require('express'); const router = express.Router(); const mysql = require('mysql2/promise'); const { pgPool } = require('../db'); const { decrypt } = require('../utils/crypto');
+const express = require('express'); const router = express.Router(); const mysql = require('mysql2/promise'); const { pgPool } = require('../db'); const { getConnConfig } = require('../utils/crypto');
 const { requireRole } = require('../middleware/rbac');
 const { isIdentifier, validateConnectionId, validateTableRef } = require('../middleware/validate');
 const { requireConnectionAccess } = require('../middleware/access');
@@ -39,8 +39,15 @@ router.post('/generate', requireRole('admin'), async (req, res) => {
         if (!isValidIdentifier(db_name) || !isValidIdentifier(table_name)) return res.status(400).json({ error: "Invalid identifiers" });
         let sampleData = [];
         try {
-            if (conn.type === 'starrocks') { const connection = await mysql.createConnection({ host: conn.host, port: conn.port, user: conn.username, password: decrypt(conn.password) }); const [dataRows] = await connection.query(`SELECT * FROM \`${db_name}\`.\`${table_name}\` LIMIT 50`); sampleData = dataRows; await connection.end(); }
-            else if (conn.type === 'hive') { const connection = await mysql.createConnection({ host: conn.host, port: 9030, user: conn.sr_username || 'root', password: decrypt(conn.sr_password) }); try { await connection.query('SET CATALOG hudi_catalog;'); const [dataRows] = await connection.query(`SELECT * FROM \`${db_name}\`.\`${table_name}\` LIMIT 50`); sampleData = dataRows || []; } finally { await connection.end(); } }
+            if (conn.type === 'starrocks' || conn.type === 'hive') {
+                const { port, user, password } = getConnConfig(conn);
+                const connection = await mysql.createConnection({ host: conn.host, port, user, password });
+                try {
+                    if (conn.type === 'hive') await connection.query('SET CATALOG hudi_catalog;');
+                    const [dataRows] = await connection.query(`SELECT * FROM \`${db_name}\`.\`${table_name}\` LIMIT 50`);
+                    sampleData = dataRows || [];
+                } finally { await connection.end(); }
+            }
         } catch (dataErr) { console.warn('[Metadata Generate] Sample data fetch failed:', dataErr.message); sampleData = [{ warning: "Could not fetch real data. Generated based on schema only." }]; }
         const rawModel = process.env.LLM_MODEL || 'gpt-4o-mini';
         const model = ALLOWED_LLM_MODELS.has(rawModel) ? rawModel : 'gpt-4o-mini';

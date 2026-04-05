@@ -44,9 +44,6 @@ export default function Sidebar() {
                 <button onClick={() => navigate('/audit')} className={`w-full flex items-center gap-3 px-4 py-3 rounded-lg font-bold text-sm transition-all ${isActive('/audit') ? 'bg-indigo-600 text-white shadow-md shadow-indigo-200' : 'text-gray-600 hover:bg-white hover:text-indigo-600'}`}>
                     <i className="fas fa-clipboard-check w-5 text-center text-lg"></i> Audit
                 </button>
-                <button onClick={() => navigate('/datawizz')} className={`w-full flex items-center gap-3 px-4 py-3 rounded-lg font-bold text-sm transition-all ${isActive('/datawizz') ? 'bg-emerald-600 text-white shadow-md shadow-emerald-200' : 'text-gray-600 hover:bg-white hover:text-emerald-600'}`}>
-                    <i className="fas fa-chart-pie w-5 text-center text-lg"></i> Data Wizz
-                </button>
                 {user.role === 'admin' && (
                     <button onClick={() => navigate('/admin/users')} className={`w-full flex items-center gap-3 px-4 py-3 rounded-lg font-bold text-sm transition-all ${isActive('/admin') ? 'bg-indigo-600 text-white shadow-md shadow-indigo-200' : 'text-gray-600 hover:bg-white hover:text-indigo-600'}`}>
                         <i className="fas fa-users-cog w-5 text-center text-lg"></i> Users
