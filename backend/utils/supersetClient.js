@@ -26,7 +26,7 @@ const VIZ_TYPE_MAP = {
     // ── Part-of-whole / Distribution ───────────────────────────────────────────
     pie:                            'pie',
     donut:                          'pie',
-    funnel_chart:                   'pie',             // funnel_chart not available in all Superset versions
+    funnel_chart:                   'funnel_chart',
     treemap:                        'treemap_v2',
     treemap_v2:                     'treemap_v2',
     sunburst:                       'sunburst',
@@ -682,3 +682,4 @@ class SupersetClient {
 }
 
 module.exports = { SupersetClient, buildChartParams, buildPositionJson, VIZ_TYPE_MAP, FORCED_WIDTHS };
+

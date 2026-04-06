@@ -53,7 +53,12 @@ router.post('/generate', requireRole('admin'), async (req, res) => {
         const model = ALLOWED_LLM_MODELS.has(rawModel) ? rawModel : 'gpt-4o-mini';
         const safeDbName = String(db_name).slice(0, 100);
         const safeTableName = String(table_name).slice(0, 100);
-        const response = await fetch(`${process.env.LLM_API_URL}/chat/completions`, { method: 'POST', headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${process.env.LLM_API_KEY}` }, body: JSON.stringify({ model, messages: [{ role: 'user', content: `Analyze the following schema AND sample of actual data rows to draft business documentation.\nDatabase Name: ${safeDbName}\nTable Name: ${safeTableName}\nSchema: ${JSON.stringify(schema)}\nData Sample: ${JSON.stringify(truncateSampleData(sampleData, 100))}\nRespond strictly in JSON format with keys: "description", "use_case", and "column_comments".` }], temperature: 0.2, max_tokens: 4000, response_format: { type: "json_object" } }) });
+        const response = await fetch(`${process.env.LLM_API_URL}/chat/completions`, { method: 'POST', headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${process.env.LLM_API_KEY}` }, body: JSON.stringify({ model, messages: [{ role: 'user', content: `Analyze the following schema AND sample of actual data rows to draft business documentation.
+Database Name: ${safeDbName}
+Table Name: ${safeTableName}
+Schema: ${JSON.stringify(schema)}
+Data Sample: ${JSON.stringify(truncateSampleData(sampleData, 100))}
+Respond strictly in JSON format with keys: "description", "use_case", and "column_comments".` }], temperature: 0.2, max_tokens: 4000, response_format: { type: "json_object" } }) });
         if (!response.ok) throw new Error(`LLM API error: ${await response.text()}`); const data = await response.json(); const generatedMeta = JSON.parse(data.choices[0].message.content);
         res.json({ description: generatedMeta.description || '', use_case: generatedMeta.use_case || '', column_comments: generatedMeta.column_comments || {} });
     } catch (e) { console.error("[AI Generation Error]:", e); res.status(500).json({ error: "Failed to generate metadata using AI." }); }

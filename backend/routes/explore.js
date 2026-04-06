@@ -14,8 +14,7 @@ const isValidIdentifier = (name) => typeof name === 'string' && /^[a-zA-Z0-9_\-]
 
 async function setupHiveClient(conn) {
     let client; const host = conn.host; const port = Number(conn.port) || 10000;
-    if (!conn.username || !conn.username.trim()) throw new Error('Hive connection requires a username');
-    const authUser = conn.username.trim(); const authPass = conn.password || '';
+        const authUser = (conn.username && conn.username.trim() !== '') ? conn.username : 'hadoop'; const authPass = conn.password || 'dummy';
     client = new hive.HiveClient(TCLIService, TCLIService_types); client.on('error', () => {}); try { await client.connect({ host, port }, new hive.connections.TcpConnection(), new hive.auth.PlainTcpAuthentication({ username: authUser, password: authPass })); } catch (e) { client = new hive.HiveClient(TCLIService, TCLIService_types); client.on('error', () => {}); await client.connect({ host, port }, new hive.connections.TcpConnection(), new hive.auth.NoSaslAuthentication()); }
     const session = await client.openSession({ client_protocol: TCLIService_types.TProtocolVersion.HIVE_CLI_SERVICE_PROTOCOL_V10 }); const utils = new hive.HiveUtils(TCLIService_types);
     const executeQuery = async (query) => { const operation = await session.executeStatement(query); await utils.waitUntilReady(operation, false, () => {}); await utils.fetchAll(operation); const result = utils.getResult(operation).getValue(); await operation.close(); return result; };
@@ -287,3 +286,4 @@ router.post('/explore/table-details', requireConnectionAccess('connection_id'), 
 });
 
 module.exports = router;
+

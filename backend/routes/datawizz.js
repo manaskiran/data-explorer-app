@@ -914,9 +914,6 @@ router.post('/build', async (req, res) => {
     res.setHeader('Connection', 'keep-alive');
     res.flushHeaders();
 
-    // Heartbeat every 15 s — keeps the SSE connection alive through long LLM/Superset calls
-    const heartbeat = setInterval(() => { try { res.write(': ping\n\n'); } catch (_) {} }, 15000);
-
     try {
         const totalSteps = 7;
 
@@ -1016,9 +1013,8 @@ router.post('/build', async (req, res) => {
                 chartSpec = rawSpec;
             }
 
-            // If a time-series viz has no time_column (stripped or unavailable),
-            // downgrade to categorical bar (if dataset has a datetime col) or pie (if not).
-            // echarts_timeseries_bar also requires main_dttm_col at the dataset level, so
+            // Downgrade time-series charts that require datetime but have none available.
+            // echarts_timeseries_bar also needs main_dttm_col at the dataset level, so
             // when the dataset has NO datetime column we must fall back to pie instead.
             const TIME_SERIES_REQUIRES_DTTM = new Set([
                 'echarts_timeseries_line','echarts_timeseries_smooth','echarts_timeseries_step',
@@ -1151,9 +1147,9 @@ router.post('/build', async (req, res) => {
         console.error('[DataWizz Build Error]:', e.message);
         sseEmit(res, 'error', { message: e.message });
     } finally {
-        clearInterval(heartbeat);
         res.end();
     }
 });
 
 module.exports = router;
+

@@ -65,3 +65,4 @@ router.post('/calculate', requireConnectionAccess('connection_id'), async (req, 
     } catch (e) { console.error("[Observability Calc Error]:", e); res.status(500).json({ error: "Failed to calculate table volume." }); }
 });
 module.exports = router;
+

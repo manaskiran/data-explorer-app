@@ -82,7 +82,7 @@ router.get('/stats', async (req, res) => {
                 const airflowDb = new Client({
                     host: conn.host, port: conn.port || 5432, user: conn.username,
                     password: decrypt(conn.password), database: conn.sr_username || 'airflow',
-                    ssl: process.env.NODE_ENV === 'production' ? true : { rejectUnauthorized: false }
+                    ssl: { rejectUnauthorized: false }
                 });
                 try {
                     await airflowDb.connect();
@@ -168,7 +168,7 @@ router.post('/global-search', async (req, res) => {
                 const airflowDb = new Client({
                     host: conn.host, port: conn.port || 5432, user: conn.username,
                     password: decrypt(conn.password), database: conn.sr_username || 'airflow',
-                    ssl: process.env.NODE_ENV === 'production' ? true : { rejectUnauthorized: false }
+                    ssl: { rejectUnauthorized: false }
                 });
                 try {
                     await airflowDb.connect();

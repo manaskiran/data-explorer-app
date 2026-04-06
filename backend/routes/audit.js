@@ -14,7 +14,7 @@ const getAirflowDb = async (connection_id) => {
     const airflowDb = new Client({
         host: conn.host, port: conn.port || 5432, user: conn.username,
         password: decrypt(conn.password), database: conn.sr_username || 'airflow',
-        ssl: process.env.NODE_ENV === 'production' ? true : { rejectUnauthorized: false }
+        ssl: { rejectUnauthorized: false }
     });
     await airflowDb.connect();
     const uiUrl = conn.ui_url ? conn.ui_url : `https://${conn.host}:8080`;
@@ -163,7 +163,7 @@ router.post('/child-dags', requireConnectionAccess('connection_id'), async (req,
         let childDagIds = [];
         try {
             const serializedResult = await airflowDb.query(`
-                SELECT DISTINCT (regexp_matches(data::text, '"trigger_dag_id"\\s*:\\s*"([^"]+)"', 'g'))[1] AS child_dag_id
+                SELECT DISTINCT (regexp_matches(data::text, '"trigger_dag_id"\s*:\s*"([^"]+)"', 'g'))[1] AS child_dag_id
                 FROM serialized_dag
                 WHERE dag_id = $1
             `, [master_dag_id]);

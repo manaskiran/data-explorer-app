@@ -60,45 +60,6 @@ app.use(helmet({
 // Gzip/Brotli compression for all responses
 app.use(compression());
 
-// ─── Rate limiters ────────────────────────────────────────────────────────────
-app.use('/api/', rateLimit({
-    windowMs: 15 * 60 * 1000,
-    max: 300,
-    message: { error: 'Too many requests. Please try again later.' },
-    standardHeaders: true, legacyHeaders: false,
-}));
-app.use('/api/auth/', rateLimit({
-    windowMs: 15 * 60 * 1000,
-    max: 15,
-    message: { error: 'Too many login attempts. Please try again in 15 minutes.' },
-    standardHeaders: true, legacyHeaders: false,
-}));
-app.use('/api/admin/', rateLimit({
-    windowMs: 15 * 60 * 1000,
-    max: 60,
-    message: { error: 'Too many admin requests. Please try again later.' },
-    standardHeaders: true, legacyHeaders: false,
-}));
-app.use('/api/table-metadata/', rateLimit({
-    windowMs: 15 * 60 * 1000,
-    max: 100,
-    message: { error: 'Too many metadata requests. Please try again later.' },
-    standardHeaders: true, legacyHeaders: false,
-}));
-// Strict rate limit for heavy export/build operations (max 5/hour per IP)
-app.use('/api/explore/export/', rateLimit({
-    windowMs: 60 * 60 * 1000,
-    max: 5,
-    message: { error: 'Export rate limit exceeded. Please wait before exporting again.' },
-    standardHeaders: true, legacyHeaders: false,
-}));
-app.use('/api/datawizz/build', rateLimit({
-    windowMs: 60 * 60 * 1000,
-    max: 10,
-    message: { error: 'Dashboard build rate limit exceeded. Please wait.' },
-    standardHeaders: true, legacyHeaders: false,
-}));
-
 // ─── CORS ─────────────────────────────────────────────────────────────────────
 const os = require('os');
 
@@ -139,6 +100,45 @@ app.use(cors({
         cb(new Error(`CORS: origin '${origin}' not allowed`));
     },
     credentials: true
+}));
+
+// ─── Rate limiters ────────────────────────────────────────────────────────────
+app.use('/api/', rateLimit({
+    windowMs: 15 * 60 * 1000,
+    max: 2000,
+    message: { error: 'Too many requests. Please try again later.' },
+    standardHeaders: true, legacyHeaders: false,
+}));
+app.use('/api/auth/', rateLimit({
+    windowMs: 15 * 60 * 1000,
+    max: 15,
+    message: { error: 'Too many login attempts. Please try again in 15 minutes.' },
+    standardHeaders: true, legacyHeaders: false,
+}));
+app.use('/api/admin/', rateLimit({
+    windowMs: 15 * 60 * 1000,
+    max: 300,
+    message: { error: 'Too many admin requests. Please try again later.' },
+    standardHeaders: true, legacyHeaders: false,
+}));
+app.use('/api/table-metadata/', rateLimit({
+    windowMs: 15 * 60 * 1000,
+    max: 500,
+    message: { error: 'Too many metadata requests. Please try again later.' },
+    standardHeaders: true, legacyHeaders: false,
+}));
+// Strict rate limit for heavy export/build operations (max 5/hour per IP)
+app.use('/api/explore/export/', rateLimit({
+    windowMs: 60 * 60 * 1000,
+    max: 5,
+    message: { error: 'Export rate limit exceeded. Please wait before exporting again.' },
+    standardHeaders: true, legacyHeaders: false,
+}));
+app.use('/api/datawizz/build', rateLimit({
+    windowMs: 60 * 60 * 1000,
+    max: 10,
+    message: { error: 'Dashboard build rate limit exceeded. Please wait.' },
+    standardHeaders: true, legacyHeaders: false,
 }));
 
 // ─── Cookie parser ────────────────────────────────────────────────────────────
@@ -348,9 +348,6 @@ const sslOptions = {
 };
 
 const server = https.createServer(sslOptions, app);
-// Disable server-level timeout so long-running SSE streams (DataWizz build) never get cut off
-server.timeout = 0;
-server.keepAliveTimeout = 65000; // slightly above any load-balancer idle timeout
 
 const shutdown = async (signal) => {
     console.log(`[INFO] ${signal} received — starting graceful shutdown...`);
@@ -371,3 +368,4 @@ server.listen(PORT, async () => {
     startCronJobs();
     console.log(JSON.stringify({ level: 'INFO', timestamp: new Date().toISOString(), message: `Secure backend running on port ${PORT}` }));
 });
+

@@ -1,34 +1,6 @@
-import { useState, useEffect, useRef, useCallback, Component } from 'react';
+import { useState, useEffect, useRef, useCallback } from 'react';
 import { useNavigate } from 'react-router-dom';
 import api, { API } from '../utils/api';
-
-// ── Error boundary — catches React render crashes so the page never goes blank ─
-class ErrorBoundary extends Component {
-    constructor(props) { super(props); this.state = { error: null }; }
-    static getDerivedStateFromError(e) { return { error: e }; }
-    render() {
-        if (this.state.error) {
-            return (
-                <div className="flex items-center justify-center h-screen bg-[#f4f7fa]">
-                    <div className="bg-white border border-red-200 rounded-2xl p-8 max-w-md text-center shadow-sm">
-                        <div className="w-12 h-12 bg-red-100 rounded-2xl flex items-center justify-center mx-auto mb-4">
-                            <i className="fas fa-exclamation-triangle text-red-500 text-lg"></i>
-                        </div>
-                        <h2 className="text-gray-800 font-bold text-base mb-2">Something went wrong</h2>
-                        <p className="text-gray-500 text-sm mb-4">{this.state.error?.message || 'An unexpected error occurred.'}</p>
-                        <button
-                            onClick={() => this.setState({ error: null })}
-                            className="bg-emerald-600 hover:bg-emerald-700 text-white font-bold px-5 py-2 rounded-xl text-sm transition-all"
-                        >
-                            Try again
-                        </button>
-                    </div>
-                </div>
-            );
-        }
-        return this.props.children;
-    }
-}
 
 // ── SSE over GET ──────────────────────────────────────────────────────────────
 function useSSE() {
@@ -137,8 +109,7 @@ function StepPill({ n, label, active, done, onClick }) {
     );
 }
 
-// ── Chart Card ────────────────────────────────────────────────────────────────
-// Safe stringify: converts objects/arrays from LLM to readable strings so React never crashes
+// Safe stringify helper
 const safeStr = (v) => {
     if (v == null) return '';
     if (typeof v === 'string') return v;
@@ -147,20 +118,20 @@ const safeStr = (v) => {
 };
 
 // Format a QA issue/suggestion that may be a string or an LLM-returned object
-// e.g. {chart_title, issue, details} → "[Chart] Issue — Details"
 const fmtQA = (v) => {
     if (v == null) return '';
     if (typeof v === 'string') return v;
     if (typeof v === 'object') {
         const parts = [];
-        if (v.chart_title) parts.push(`[${v.chart_title}]`);
+        if (v.chart_title) parts.push('[' + v.chart_title + ']');
         if (v.issue || v.message) parts.push(v.issue || v.message);
         if (v.details) parts.push(v.details);
-        return parts.join(' — ') || JSON.stringify(v);
+        return parts.join(' -- ') || JSON.stringify(v);
     }
     return String(v);
 };
 
+// ── Chart Card ────────────────────────────────────────────────────────────────
 function ChartCard({ chart }) {
     const VIZ = {
         big_number_total:       { icon: 'fa-hashtag',    color: 'text-emerald-600', bg: 'bg-emerald-50 border-emerald-200' },
@@ -172,7 +143,7 @@ function ChartCard({ chart }) {
         echarts_scatter:        { icon: 'fa-braille',    color: 'text-amber-600',   bg: 'bg-amber-50 border-amber-200'     },
     };
     const v = VIZ[chart.viz_type] || { icon: 'fa-chart-area', color: 'text-gray-500', bg: 'bg-gray-50 border-gray-200' };
-    const metrics = (chart.metrics || []).map(m => safeStr(m.label || `${m.aggregate}(${m.column?.column_name})`));
+    const metrics = (chart.metrics || []).map(m => m.label || `${m.aggregate}(${m.column?.column_name})`);
 
     return (
         <div className="bg-white border border-gray-200 rounded-2xl p-4 hover:border-emerald-200 hover:shadow-sm transition-all">
@@ -182,13 +153,13 @@ function ChartCard({ chart }) {
                 </div>
                 <div className="flex-1 min-w-0">
                     <div className="flex items-center justify-between gap-2 mb-0.5">
-                        <h4 className="text-gray-800 text-sm font-bold truncate">{safeStr(chart.title)}</h4>
+                        <h4 className="text-gray-800 text-sm font-bold truncate">{chart.title}</h4>
                         <span className="text-[9px] font-bold bg-gray-100 text-gray-400 px-1.5 py-0.5 rounded uppercase tracking-wider shrink-0">w{chart.width}</span>
                     </div>
-                    <p className={`text-[10px] font-bold uppercase tracking-widest mb-1.5 ${v.color}`}>{safeStr(chart.viz_type)}</p>
+                    <p className={`text-[10px] font-bold uppercase tracking-widest mb-1.5 ${v.color}`}>{chart.viz_type}</p>
                     {metrics.length > 0 && <p className="text-[11px] text-gray-500"><span className="text-gray-600">Metrics:</span> {metrics.join(', ')}</p>}
-                    {chart.groupby?.length > 0 && <p className="text-[11px] text-gray-500"><span className="text-gray-600">Group by:</span> {chart.groupby.map(safeStr).join(', ')}</p>}
-                    {chart.reasoning && <p className="text-[10px] text-gray-400 mt-1.5 italic leading-relaxed">{safeStr(chart.reasoning)}</p>}
+                    {chart.groupby?.length > 0 && <p className="text-[11px] text-gray-500"><span className="text-gray-600">Group by:</span> {chart.groupby.join(', ')}</p>}
+                    {chart.reasoning && <p className="text-[10px] text-gray-400 mt-1.5 italic leading-relaxed">{chart.reasoning}</p>}
                 </div>
             </div>
         </div>
@@ -216,7 +187,7 @@ function makeSource(id) {
 }
 
 // ── Main Component ────────────────────────────────────────────────────────────
-function DataWizzInner() {
+export default function DataWizz() {
     const navigate = useNavigate();
     const [step, setStep] = useState(1);
 
@@ -802,8 +773,8 @@ function DataWizzInner() {
                                                 <i className="fas fa-check text-white text-sm"></i>
                                             </div>
                                             <div>
-                                                <p className="font-extrabold text-gray-800 text-base">{safeStr(dashboardPlan.dashboard_title)}</p>
-                                                <p className="text-gray-500 text-sm mt-0.5">{safeStr(dashboardPlan.reasoning)}</p>
+                                                <p className="font-extrabold text-gray-800 text-base">{dashboardPlan.dashboard_title}</p>
+                                                <p className="text-gray-500 text-sm mt-0.5">{dashboardPlan.reasoning}</p>
                                             </div>
                                         </div>
 
@@ -884,23 +855,19 @@ function DataWizzInner() {
                                         </div>
 
                                         {/* Charts built */}
-                                        {Array.isArray(buildResult.chartActions) && buildResult.chartActions.length > 0 && (
+                                        {buildResult.chartActions?.length > 0 && (
                                             <div className="bg-white rounded-2xl shadow-sm border border-gray-200 p-5">
                                                 <p className="text-sm font-bold text-gray-500 uppercase tracking-widest mb-4">Charts built ({buildResult.chartActions.length})</p>
                                                 <div className="space-y-2">
-                                                    {buildResult.chartActions.map((entry, i) => {
-                                                        const id = Array.isArray(entry) ? entry[0] : entry;
-                                                        const action = Array.isArray(entry) ? entry[1] : 'created';
-                                                        return (
+                                                    {buildResult.chartActions.map(([id, action], i) => (
                                                         <div key={i} className="flex items-center gap-3 text-xs">
                                                             <span className={`font-bold px-2 py-0.5 rounded-lg ${action === 'created' ? 'bg-emerald-50 text-emerald-700 border border-emerald-200' : 'bg-sky-50 text-sky-700 border border-sky-200'}`}>
                                                                 {action}
                                                             </span>
                                                             <span className="font-mono text-gray-400">#{id}</span>
-                                                            {dashboardPlan?.charts?.[i]?.title && <span className="text-gray-600 font-medium">{safeStr(dashboardPlan.charts[i].title)}</span>}
+                                                            {dashboardPlan?.charts?.[i] && <span className="text-gray-600 font-medium">{safeStr(dashboardPlan.charts[i].title)}</span>}
                                                         </div>
-                                                        );
-                                                    })}
+                                                    ))}
                                                 </div>
                                             </div>
                                         )}
@@ -910,14 +877,14 @@ function DataWizzInner() {
                                             <div className={`border rounded-2xl p-5 ${buildResult.qaReport.passed ? 'bg-emerald-50 border-emerald-200' : 'bg-amber-50 border-amber-200'}`}>
                                                 <p className={`text-sm font-bold uppercase tracking-widest mb-3 flex items-center gap-2 ${buildResult.qaReport.passed ? 'text-emerald-700' : 'text-amber-700'}`}>
                                                     <i className={`fas ${buildResult.qaReport.passed ? 'fa-shield-check' : 'fa-exclamation-triangle'} text-xs`}></i>
-                                                    QA Review {buildResult.qaReport.passed ? 'Passed' : `— ${(buildResult.qaReport.issues || []).length} issue(s)`}
+                                                    QA Review {buildResult.qaReport.passed ? 'Passed' : `— ${buildResult.qaReport.issues.length} issue(s)`}
                                                 </p>
-                                                {(buildResult.qaReport.issues || []).map((issue, i) => (
+                                                {buildResult.qaReport.issues.map((issue, i) => (
                                                     <p key={i} className="text-xs text-amber-700 flex items-start gap-1.5 mb-1.5">
                                                         <i className="fas fa-times-circle mt-0.5 shrink-0"></i>{fmtQA(issue)}
                                                     </p>
                                                 ))}
-                                                {(buildResult.qaReport.suggestions || []).map((s, i) => (
+                                                {buildResult.qaReport.suggestions.map((s, i) => (
                                                     <p key={i} className="text-xs text-gray-500 flex items-start gap-1.5 mb-1.5">
                                                         <i className="fas fa-lightbulb text-amber-500 mt-0.5 shrink-0"></i>{fmtQA(s)}
                                                     </p>
@@ -948,6 +915,3 @@ function DataWizzInner() {
     );
 }
 
-export default function DataWizz() {
-    return <ErrorBoundary><DataWizzInner /></ErrorBoundary>;
-}
