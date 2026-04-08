@@ -162,6 +162,19 @@ const initDb = async () => {
                 FOREIGN KEY (connection_id) REFERENCES explorer_connections(id) ON DELETE CASCADE
             )`);
 
+        // ── Superset connection store ─────────────────────────────────────────
+        await pgPool.query(`
+            CREATE TABLE IF NOT EXISTS explorer_superset_connections (
+                id         SERIAL PRIMARY KEY,
+                name       VARCHAR(255) NOT NULL,
+                url        VARCHAR(512) NOT NULL,
+                username   VARCHAR(255) NOT NULL,
+                password   VARCHAR(255) NOT NULL,
+                created_by VARCHAR(255),
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )`);
+        await silentDDL("CREATE UNIQUE INDEX IF NOT EXISTS idx_superset_conn_name ON explorer_superset_connections(name)");
+
         // ── Idempotent schema migrations ──────────────────────────────────────
         await silentDDL("ALTER TABLE explorer_table_metadata ADD COLUMN column_comments JSONB DEFAULT '{}'::jsonb");
         await silentDDL("ALTER TABLE explorer_connections ADD COLUMN ui_url VARCHAR(255)");
@@ -263,7 +276,7 @@ function getConnConfig(conn) {
     if (conn.type === 'starrocks') {
         return { port: conn.port, user: conn.username, password: decrypt(conn.password) };
     }
-    return { port: 9030, user: conn.sr_username || 'root', password: decrypt(conn.sr_password) || '' };
+    return { port: 9030, user: conn.sr_username || process.env.SR_DEFAULT_USER || 'root', password: decrypt(conn.sr_password) || '' };
 }
 
 module.exports = { encrypt, decrypt, getConnConfig };
@@ -304,6 +317,60 @@ const maskDataPreview = (val, key = '') => {
 };
 
 module.exports = { maskHost, maskDataPreview };
+EOF
+
+cat << 'EOF' > "$APP_DIR/backend/utils/lineageParser.js"
+const DAG_LAYER_PATTERNS = [
+  { pattern: /^get_(csv|yaml|json)_/i,                       layer: 'source',   transformation: 'extraction' },
+  { pattern: /^put_(csv|yaml)_source_to_staging_|^push_(csv|yaml)_staging_(?!to)/i,  layer: 'staging',  transformation: 'staging_push' },
+  { pattern: /^push_(csv|yaml)_staging_to_hdfs_/i,                   layer: 'raw_hdfs',  transformation: 'hdfs_push' },
+  { pattern: /^ingest_(csv_)?hdfs_to_hudi_/i,                        layer: 'raw_hudi',  transformation: 'hudi_ingestion' },
+  { pattern: /^create_(techsophy_|medunited_)?.*_curate[d]?$/i,       layer: 'curated',   transformation: 'curation' },
+  { pattern: /^create_(star_schema_|table_.*_service|.*_service(_delta)?$)/i,        layer: 'service',   transformation: 'service_load' },
+  { pattern: /^(upload_|create_(daily|monthly)_)/i,                  layer: 'reporting', transformation: 'reporting_upload' },
+  { pattern: /^master_/i,                                            layer: 'orchestrator', transformation: 'orchestration' },
+];
+
+const LAYER_ORDER = ['source', 'staging', 'raw_hdfs', 'raw_hudi', 'curated', 'service', 'reporting'];
+
+const extractPipelineKey = (dagId) => {
+  let s = dagId.toLowerCase();
+  s = s.replace(/^(get|put|push|ingest|create|upload|master)_/, '');
+  s = s.replace(/^(csv|yaml|json)_/, '');
+  s = s.replace(/^source_to_staging_/, '').replace(/^staging_to_hdfs_/, '').replace(/^hdfs_to_hudi_/, '').replace(/^staging_/, '');
+  s = s.replace(/^(techsophy|medunited)_/, '');
+  s = s.replace(/_curated?$/, '').replace(/_service(_delta)?$/, '').replace(/_hdfs$/, '').replace(/_hudi$/, '').replace(/_staging$/, '');
+  return s.trim() || dagId;
+};
+
+const extractApplication = (dagId) => {
+  const key = extractPipelineKey(dagId);
+  const parts = key.split('_');
+  const genericSuffixes = ['postgres', 'postgresql', 'mongodb', 'mongo', 'mysql', 'mssql', 'oracle', 'archive', 'raw', 'dump'];
+  if (parts.length > 1 && genericSuffixes.includes(parts[parts.length - 1])) {
+    return parts.slice(0, -1).join('_');
+  }
+  return key;
+};
+
+const detectLayer = (dagId) => {
+  for (const { pattern, layer, transformation } of DAG_LAYER_PATTERNS) {
+    if (pattern.test(dagId)) return { layer, transformation };
+  }
+  return { layer: 'unknown', transformation: 'unknown' };
+};
+
+const LAYER_LABELS = {
+  source:    { label: 'Source',    color: '#3b82f6' },
+  staging:   { label: 'Staging',   color: '#8b5cf6' },
+  raw_hdfs:  { label: 'Raw HDFS',  color: '#0ea5e9' },
+  raw_hudi:  { label: 'Raw Hudi',  color: '#06b6d4' },
+  curated:   { label: 'Curated',   color: '#10b981' },
+  service:   { label: 'Service',   color: '#f59e0b' },
+  reporting: { label: 'Reporting', color: '#ef4444' },
+};
+
+module.exports = { detectLayer, extractApplication, LAYER_LABELS, LAYER_ORDER };
 EOF
 
 cat << 'ENDOFFILE' > "$APP_DIR/backend/utils/supersetClient.js"
@@ -1014,7 +1081,7 @@ const express = require('express');
 const router = express.Router();
 const mysql = require('mysql2/promise');
 const { pgPool } = require('../db');
-const { decrypt } = require('../utils/crypto');
+const { encrypt, decrypt } = require('../utils/crypto');
 const { SupersetClient, buildPositionJson } = require('../utils/supersetClient');
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -1727,13 +1794,55 @@ router.post('/schema', async (req, res) => {
     }
 });
 
-/** POST /api/datawizz/superset/test — test Superset credentials */
+// ── Superset Connection Store (CRUD) ─────────────────────────────────────────
+
+async function resolveSuperset(body) {
+    if (body.superset_connection_id) {
+        const { rows } = await pgPool.query(
+            'SELECT url, username, password FROM explorer_superset_connections WHERE id = $1',
+            [parseInt(body.superset_connection_id, 10)]
+        );
+        if (!rows.length) throw new Error('Superset connection not found.');
+        return { url: rows[0].url, username: rows[0].username, password: decrypt(rows[0].password) };
+    }
+    const { url, username, password } = body;
+    if (!url || !username || !password) throw new Error('superset_connection_id or (url + username + password) are required.');
+    return { url, username, password };
+}
+
+router.post('/superset/connections', async (req, res) => {
+    try {
+        const { name, url, username, password } = req.body;
+        if (!name || !url || !username || !password) return res.status(400).json({ error: 'name, url, username, and password are required.' });
+        await pgPool.query(
+            `INSERT INTO explorer_superset_connections (name, url, username, password, created_by) VALUES ($1,$2,$3,$4,$5) ON CONFLICT (name) DO UPDATE SET url=$2, username=$3, password=$4, created_by=$5`,
+            [name, url, username, encrypt(password), req.user.username]
+        );
+        res.status(201).json({ success: true });
+    } catch (e) { console.error('[Superset Conn Save Error]:', e.message); res.status(500).json({ error: 'Failed to save Superset connection.' }); }
+});
+
+router.get('/superset/connections', async (req, res) => {
+    try {
+        const { rows } = await pgPool.query('SELECT id, name, url, username, created_by, created_at FROM explorer_superset_connections ORDER BY name ASC');
+        res.json(rows);
+    } catch (e) { console.error('[Superset Conn List Error]:', e.message); res.status(500).json({ error: 'Failed to list Superset connections.' }); }
+});
+
+router.delete('/superset/connections/:id', async (req, res) => {
+    const id = parseInt(req.params.id, 10);
+    if (!id) return res.status(400).json({ error: 'Invalid connection ID.' });
+    try {
+        const { rowCount } = await pgPool.query('DELETE FROM explorer_superset_connections WHERE id = $1', [id]);
+        if (!rowCount) return res.status(404).json({ error: 'Connection not found.' });
+        res.json({ success: true });
+    } catch (e) { console.error('[Superset Conn Delete Error]:', e.message); res.status(500).json({ error: 'Failed to delete Superset connection.' }); }
+});
+
+/** POST /api/datawizz/superset/test — test Superset credentials or stored connection */
 router.post('/superset/test', async (req, res) => {
     try {
-        const { url, username, password } = req.body;
-        if (!url || !username || !password) {
-            return res.status(400).json({ error: 'url, username, and password are required.' });
-        }
+        const { url, username, password } = await resolveSuperset(req.body);
         const client = new SupersetClient({ baseUrl: url, username, password });
         await client.authenticate();
         await client.testConnection();
@@ -1743,20 +1852,15 @@ router.post('/superset/test', async (req, res) => {
     }
 });
 
-/** GET /api/datawizz/superset/datasets — list datasets from Superset */
+/** POST /api/datawizz/superset/datasets — list datasets from Superset */
 router.post('/superset/datasets', async (req, res) => {
     try {
-        const { url, username, password } = req.body;
-        if (!url || !username || !password) {
-            return res.status(400).json({ error: 'url, username, and password are required.' });
-        }
+        const { url, username, password } = await resolveSuperset(req.body);
         const client = new SupersetClient({ baseUrl: url, username, password });
         await client.authenticate();
         const datasets = await client.listDatasets();
         res.json(datasets);
-    } catch (e) {
-        res.status(500).json({ error: e.message });
-    }
+    } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 /**
@@ -1891,20 +1995,16 @@ router.get('/plan', async (req, res) => {
  * POST /api/datawizz/build — SSE endpoint
  * Builds charts + dashboard in Superset and runs QA review.
  *
- * Body: { plan, datasetInfo, dataset_name, superset_url, superset_username, superset_password, dashboard_id? }
+ * Body: { plan, datasetInfo, dataset_name, superset_connection_id | (superset_url+superset_username+superset_password), dashboard_id? }
  */
 router.post('/build', async (req, res) => {
-    const {
-        plan, datasetInfo, dataset_name,
-        superset_url, superset_username, superset_password,
-        dashboard_id,
-    } = req.body;
-
-    if (!plan || !dataset_name || !superset_url || !superset_username || !superset_password) {
-        return res.status(400).json({
-            error: 'plan, dataset_name, superset_url, superset_username, and superset_password are required.',
-        });
+    const { plan, datasetInfo, dataset_name, dashboard_id } = req.body;
+    if (!plan || !dataset_name) {
+        return res.status(400).json({ error: 'plan and dataset_name are required.' });
     }
+    let supersetCreds;
+    try { supersetCreds = await resolveSuperset(req.body); }
+    catch (e) { return res.status(400).json({ error: e.message }); }
 
     res.setHeader('Content-Type', 'text/event-stream');
     res.setHeader('Cache-Control', 'no-cache');
@@ -1917,9 +2017,9 @@ router.post('/build', async (req, res) => {
         // Step 1: Authenticate with Superset
         sseEmit(res, 'progress', { message: '🔐 Authenticating with Superset...', step: 1, total: totalSteps });
         const client = new SupersetClient({
-            baseUrl: superset_url,
-            username: superset_username,
-            password: superset_password,
+            baseUrl: supersetCreds.url,
+            username: supersetCreds.username,
+            password: supersetCreds.password,
         });
         await client.authenticate();
         sseEmit(res, 'progress', { message: '✅ Superset authenticated.', step: 1, total: totalSteps });
@@ -2188,7 +2288,7 @@ async function runGlobalObservabilityScan() {
                             try { const [schemaCols] = await mysqlConn.query(`DESCRIBE \`${db}\`.\`${table}\``); isHudi = schemaCols.some(c => c.Field === '_hoodie_record_key'); } catch(e) { console.warn(`[Cron] Hudi check failed for ${db}.${table}:`, e.message); }
                             if (isHudi) {
                                 const [totalResult] = await mysqlConn.query(`SELECT COUNT(DISTINCT \`_hoodie_record_key\`) as count FROM \`${db}\`.\`${table}\``);
-                                const [todayResult] = await mysqlConn.query(`SELECT COUNT(DISTINCT \`_hoodie_record_key\`) as count FROM \`${db}\`.\`${table}\` WHERE \`_hoodie_commit_time\` LIKE '${todayStr}%'`);
+                                const [todayResult] = await mysqlConn.query(`SELECT COUNT(DISTINCT \`_hoodie_record_key\`) as count FROM \`${db}\`.\`${table}\` WHERE \`_hoodie_commit_time\` LIKE ?`, [\`${todayStr}%\`]);
                                 total = Number(totalResult[0].count); today = Number(todayResult[0].count); previous = total - today;
                             } else {
                                 const [totalResult] = await mysqlConn.query(`SELECT COUNT(*) as count FROM \`${db}\`.\`${table}\``);
@@ -2491,6 +2591,9 @@ router.delete('/users/:id', async (req, res) => {
             return res.status(400).json({ error: 'You cannot delete your own account.' });
         }
 
+        const { rows: targetRows } = await pgPool.query(
+            'SELECT username FROM explorer_users WHERE id = $1', [targetId]
+        );
         const { rowCount } = await pgPool.query(
             'DELETE FROM explorer_users WHERE id = $1', [targetId]
         );
@@ -2607,7 +2710,7 @@ const getAirflowDb = async (connection_id) => {
     const airflowDb = new Client({
         host: conn.host, port: conn.port || 5432, user: conn.username,
         password: decrypt(conn.password), database: conn.sr_username || 'airflow',
-        ssl: process.env.NODE_ENV === 'production' ? true : { rejectUnauthorized: false }
+        ssl: { rejectUnauthorized: false }
     });
     await airflowDb.connect();
     const uiUrl = conn.ui_url ? conn.ui_url : `https://${conn.host}:8080`;
@@ -2848,6 +2951,7 @@ EOF
 
 cat << 'EOF' > $APP_DIR/backend/routes/metadata.js
 const express = require('express'); const router = express.Router(); const mysql = require('mysql2/promise'); const { pgPool } = require('../db'); const { getConnConfig } = require('../utils/crypto');
+const rateLimit = require('express-rate-limit');
 const { requireRole } = require('../middleware/rbac');
 const { isIdentifier, validateConnectionId, validateTableRef } = require('../middleware/validate');
 const { requireConnectionAccess } = require('../middleware/access');
@@ -2968,7 +3072,7 @@ router.post('/calculate', requireConnectionAccess('connection_id'), async (req, 
             if (conn.type === 'hive') await connection.query('SET CATALOG hudi_catalog;');
             let isHudi = false; try { const [schemaCols] = await connection.query(`DESCRIBE \`${db_name}\`.\`${table_name}\``); isHudi = schemaCols.some(c => c.Field === '_hoodie_record_key'); } catch(e) { console.warn('[Observability] Hudi check failed:', e.message); }
             if (isHudi) {
-                const [totalResult] = await connection.query(`SELECT COUNT(DISTINCT \`_hoodie_record_key\`) as count FROM \`${db_name}\`.\`${table_name}\``); const [todayResult] = await connection.query(`SELECT COUNT(DISTINCT \`_hoodie_record_key\`) as count FROM \`${db_name}\`.\`${table_name}\` WHERE \`_hoodie_commit_time\` LIKE '${todayStr}%'`); total = Number(totalResult[0].count); today = Number(todayResult[0].count); previous = total - today; typeStr = 'starrocks_hudi_fast';
+                const [totalResult] = await connection.query(`SELECT COUNT(DISTINCT \`_hoodie_record_key\`) as count FROM \`${db_name}\`.\`${table_name}\``); const [todayResult] = await connection.query(`SELECT COUNT(DISTINCT \`_hoodie_record_key\`) as count FROM \`${db_name}\`.\`${table_name}\` WHERE \`_hoodie_commit_time\` LIKE ?`, [\`${todayStr}%\`]); total = Number(totalResult[0].count); today = Number(todayResult[0].count); previous = total - today; typeStr = 'starrocks_hudi_fast';
             } else { const [totalResult] = await connection.query(`SELECT COUNT(*) as count FROM \`${db_name}\`.\`${table_name}\``); total = Number(totalResult[0].count); today = null; previous = null; }
         } finally { await connection.end(); }
         await pgPool.query(
@@ -2991,23 +3095,79 @@ const express = require('express'); const router = express.Router(); const mysql
 const { maskDataPreview } = require('../utils/masking');
 const { requireConnectionAccess } = require('../middleware/access');
 const globalHiveCache = {};
-const HIVE_CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
-// Purge expired cache entries every 10 minutes to prevent unbounded memory growth
+const HIVE_CACHE_TTL_MS  = 5 * 60 * 1000;
+const HIVE_CACHE_MAX_KEYS = 500;
 setInterval(() => {
     const now = Date.now();
-    for (const key of Object.keys(globalHiveCache)) {
-        if (now - (globalHiveCache[key]?.__ts || 0) > HIVE_CACHE_TTL_MS) delete globalHiveCache[key];
+    for (const connId of Object.keys(globalHiveCache)) {
+        const bucket = globalHiveCache[connId];
+        for (const key of Object.keys(bucket)) {
+            if (key.endsWith('__ts') && now - bucket[key] > HIVE_CACHE_TTL_MS) {
+                const base = key.slice(0, -4); delete bucket[base]; delete bucket[key];
+            }
+        }
+        if (Object.keys(bucket).length === 0) delete globalHiveCache[connId];
     }
 }, 10 * 60 * 1000).unref();
+function hiveCacheEvict(bucket) {
+    const tsKeys = Object.keys(bucket).filter(k => k.endsWith('__ts'));
+    if (tsKeys.length < HIVE_CACHE_MAX_KEYS) return;
+    tsKeys.sort((a, b) => bucket[a] - bucket[b]);
+    const toRemove = tsKeys.slice(0, Math.floor(tsKeys.length / 2));
+    for (const k of toRemove) { const base = k.slice(0, -4); delete bucket[base]; delete bucket[k]; }
+}
 const isValidIdentifier = (name) => typeof name === 'string' && /^[a-zA-Z0-9_\-]+$/.test(name);
 
+const HIVE_CONNECT_TIMEOUT_MS = 20000;
+const HIVE_QUERY_TIMEOUT_MS   = 30000;
+
+const withTimeout = (promise, ms, label) =>
+    Promise.race([
+        promise,
+        new Promise((_, reject) =>
+            setTimeout(() => reject(new Error(`HIVE_TIMEOUT: ${label} exceeded ${ms}ms`)), ms)
+        ),
+    ]);
+
 async function setupHiveClient(conn) {
-    let client; const host = conn.host; const port = Number(conn.port) || 10000;
-    if (!conn.username || !conn.username.trim()) throw new Error('Hive connection requires a username');
-    const authUser = conn.username.trim(); const authPass = conn.password || '';
-    client = new hive.HiveClient(TCLIService, TCLIService_types); client.on('error', () => {}); try { await client.connect({ host, port }, new hive.connections.TcpConnection(), new hive.auth.PlainTcpAuthentication({ username: authUser, password: authPass })); } catch (e) { client = new hive.HiveClient(TCLIService, TCLIService_types); client.on('error', () => {}); await client.connect({ host, port }, new hive.connections.TcpConnection(), new hive.auth.NoSaslAuthentication()); }
-    const session = await client.openSession({ client_protocol: TCLIService_types.TProtocolVersion.HIVE_CLI_SERVICE_PROTOCOL_V10 }); const utils = new hive.HiveUtils(TCLIService_types);
-    const executeQuery = async (query) => { const operation = await session.executeStatement(query); await utils.waitUntilReady(operation, false, () => {}); await utils.fetchAll(operation); const result = utils.getResult(operation).getValue(); await operation.close(); return result; };
+    const host     = conn.host;
+    const port     = Number(conn.port) || 10000;
+    const authUser = (conn.username && conn.username.trim() !== '') ? conn.username : (process.env.HIVE_DEFAULT_USER || 'hadoop');
+    const authPass = conn.password || process.env.HIVE_DEFAULT_PASSWORD || '';
+
+    let client = new hive.HiveClient(TCLIService, TCLIService_types);
+    client.on('error', () => {});
+
+    try {
+        await withTimeout(
+            client.connect({ host, port }, new hive.connections.TcpConnection(), new hive.auth.PlainTcpAuthentication({ username: authUser, password: authPass })),
+            HIVE_CONNECT_TIMEOUT_MS, 'Hive PlainTCP connect'
+        );
+    } catch (e) {
+        if (e.message.startsWith('HIVE_TIMEOUT')) throw e;
+        client = new hive.HiveClient(TCLIService, TCLIService_types);
+        client.on('error', () => {});
+        await withTimeout(
+            client.connect({ host, port }, new hive.connections.TcpConnection(), new hive.auth.NoSaslAuthentication()),
+            HIVE_CONNECT_TIMEOUT_MS, 'Hive NoSASL connect'
+        );
+    }
+
+    const session = await withTimeout(
+        client.openSession({ client_protocol: TCLIService_types.TProtocolVersion.HIVE_CLI_SERVICE_PROTOCOL_V10 }),
+        HIVE_CONNECT_TIMEOUT_MS, 'Hive openSession'
+    );
+    const utils = new hive.HiveUtils(TCLIService_types);
+
+    const executeQuery = async (query) => {
+        const operation = await withTimeout(session.executeStatement(query), HIVE_QUERY_TIMEOUT_MS, `executeStatement: ${query.slice(0, 60)}`);
+        await withTimeout(utils.waitUntilReady(operation, false, () => {}), HIVE_QUERY_TIMEOUT_MS, 'waitUntilReady');
+        await withTimeout(utils.fetchAll(operation), HIVE_QUERY_TIMEOUT_MS, 'fetchAll');
+        const result = utils.getResult(operation).getValue();
+        await operation.close();
+        return result;
+    };
+
     return { client, session, executeQuery };
 }
 
@@ -3019,11 +3179,12 @@ async function getSrConnection(host, port, user, password) {
 }
 
 router.post('/explore/fetch', requireConnectionAccess('id'), async (req, res) => {
+    req.setTimeout(60000);
     try {
         const { rows } = await pgPool.query('SELECT * FROM explorer_connections WHERE id = $1', [req.body.id]); if (!rows.length) return res.status(404).json({ error: 'Connection not found' });
         const conn = rows[0]; conn.password = decrypt(conn.password); conn.sr_password = decrypt(conn.sr_password);
         const { type, db, table } = req.body; if (db && !isValidIdentifier(db)) return res.status(400).json({ error: "Invalid database identifier" }); if (table && !isValidIdentifier(table)) return res.status(400).json({ error: "Invalid table identifier" });
-        
+
         if (conn.type === 'starrocks') {
             const connection = await getSrConnection(conn.host, conn.port, conn.username, conn.password);
             try {
@@ -3032,18 +3193,23 @@ router.post('/explore/fetch', requireConnectionAccess('id'), async (req, res) =>
                 else if (type === 'schema') { const [r] = await connection.query(`DESCRIBE \`${db}\`.\`${table}\``); res.json({ schema: r, last_updated: null, properties: {} }); }
             } finally { await connection.end(); }
         } else if (conn.type === 'hive') {
-            if (type === 'schema') {
-                const connection = await getSrConnection(conn.host, 9030, conn.sr_username || 'root', conn.sr_password || '');
-                try { await connection.query('SET CATALOG hudi_catalog;'); const [schemaRows] = await connection.query(`DESCRIBE \`${db}\`.\`${table}\``); res.json({ schema: schemaRows, last_updated: null, properties: {} }); } finally { await connection.end(); }
-            } else {
-                const { client, session, executeQuery } = await setupHiveClient(conn);
-                try {
-                    if (type === 'databases') { const r = await executeQuery('SHOW DATABASES'); res.json(r.map(row => Object.values(row)[0])); } 
-                    else if (type === 'tables') { await executeQuery(`USE \`${db}\``); const r = await executeQuery('SHOW TABLES'); res.json(r.map(row => Object.values(row)[Object.values(row).length - 1])); } 
-                } finally { try{if(session) await session.close();}catch(e){} try{if(client) await client.close();}catch(e){} }
-            }
+            // All Hive operations go through StarRocks MySQL (hudi_catalog) — direct Hive TCP is not used
+            const connection = await getSrConnection(conn.host, 9030, conn.sr_username || process.env.SR_DEFAULT_USER || 'root', decrypt(conn.sr_password) || '');
+            try {
+                await connection.query('SET CATALOG hudi_catalog;');
+                if (type === 'databases') {
+                    const [r] = await connection.query('SHOW DATABASES');
+                    res.json(r.map(row => Object.values(row)[0]).filter(d => d !== 'information_schema' && d !== 'sys'));
+                } else if (type === 'tables') {
+                    const [r] = await connection.query(`SHOW TABLES FROM \`${db}\``);
+                    res.json(r.map(row => Object.values(row)[0]));
+                } else if (type === 'schema') {
+                    const [schemaRows] = await connection.query(`DESCRIBE \`${db}\`.\`${table}\``);
+                    res.json({ schema: schemaRows, last_updated: null, properties: {} });
+                }
+            } finally { await connection.end(); }
         }
-    } catch (e) { console.error("[Explore Fetch Error]:", e); res.status(500).json({ error: "Failed to fetch exploration data." }); }
+    } catch (e) { console.error("[Explore Fetch Error]:", e.message); res.status(500).json({ error: "Failed to fetch exploration data." }); }
 });
 
 router.post('/search/fetch', requireConnectionAccess('id'), async (req, res) => {
@@ -3066,7 +3232,7 @@ router.post('/search/fetch', requireConnectionAccess('id'), async (req, res) => 
                             await Promise.all(tables.slice(j, j + 10).map(async (tName) => {
                                 const cacheKey = `${dbs[i]}.${tName}`; let columns = myCache[cacheKey]; 
                                 if (!columns || (myCache[`${cacheKey}__ts`] && Date.now() - myCache[`${cacheKey}__ts`] > HIVE_CACHE_TTL_MS)) {
-                                    try { const schema = await safeQuery(`DESCRIBE \`${dbs[i]}\`.\`${tName}\``, 6000); if (schema && schema.length > 0) { columns = schema.filter(r => r.col_name).map(r => r.col_name); myCache[cacheKey] = columns; myCache[`${cacheKey}__ts`] = Date.now(); } else { columns = []; } } catch(e) { console.warn(`[HiveCache] DESCRIBE failed for ${cacheKey}:`, e.message); columns = []; } }
+                                    try { const schema = await safeQuery(`DESCRIBE \`${dbs[i]}\`.\`${tName}\``, 6000); if (schema && schema.length > 0) { columns = schema.filter(r => r.col_name).map(r => r.col_name); hiveCacheEvict(myCache); myCache[cacheKey] = columns; myCache[`${cacheKey}__ts`] = Date.now(); } else { columns = []; } } catch(e) { console.warn(`[HiveCache] DESCRIBE failed for ${cacheKey}:`, e.message); columns = []; } }
                                 for (let c of columns) { if (c.toLowerCase().includes(col.toLowerCase())) results.push({ db: dbs[i], tbl: tName, col: c }); }
                             }));
                         }
@@ -3079,7 +3245,9 @@ router.post('/search/fetch', requireConnectionAccess('id'), async (req, res) => 
 });
 
 router.post('/export/fetch', requireConnectionAccess('id'), async (req, res) => {
-    req.setTimeout(1200000); 
+    const EXPORT_ROW_LIMIT  = 50000;
+    const EXPORT_TIMEOUT_MS = 120000;
+    req.setTimeout(EXPORT_TIMEOUT_MS); 
     try {
         const { rows } = await pgPool.query('SELECT * FROM explorer_connections WHERE id = $1', [req.body.id]); if (!rows.length) return res.status(404).json({ error: 'Connection not found' });
         const conn = rows[0]; conn.password = decrypt(conn.password); conn.sr_password = decrypt(conn.sr_password);
@@ -3094,7 +3262,7 @@ router.post('/export/fetch', requireConnectionAccess('id'), async (req, res) => 
         if (conn.type === 'starrocks') {
             const connection = await getSrConnection(conn.host, conn.port, conn.username, conn.password);
             try {
-                const [cols] = await connection.query(`SELECT TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME, DATA_TYPE, COLUMN_COMMENT FROM information_schema.columns WHERE TABLE_SCHEMA = ? ORDER BY TABLE_NAME, ORDINAL_POSITION`, [req.body.db]);
+                const [cols] = await connection.query(`SELECT TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME, DATA_TYPE, COLUMN_COMMENT FROM information_schema.columns WHERE TABLE_SCHEMA = ? ORDER BY TABLE_NAME, ORDINAL_POSITION LIMIT ${EXPORT_ROW_LIMIT}`, [req.body.db]);
                 cols.forEach(c => { const overrideComment = dbMeta[c.TABLE_NAME]?.[c.COLUMN_NAME]; worksheet.addRow({ db: c.TABLE_SCHEMA, table: c.TABLE_NAME, column: c.COLUMN_NAME, type: c.DATA_TYPE, comment: overrideComment || c.COLUMN_COMMENT || '' }); });
             } finally { await connection.end(); }
         } else {
@@ -3102,7 +3270,7 @@ router.post('/export/fetch', requireConnectionAccess('id'), async (req, res) => 
             try {
                 // isValidIdentifier already enforced above; use backtick quoting for Hive identifier safety
                 const safeDb = req.body.db.replace(/`/g, '');
-                const allCols = await Promise.race([ setup.executeQuery(`SELECT table_name, column_name, data_type, comment FROM information_schema.columns WHERE table_schema = \`${safeDb}\``), new Promise((_, r) => setTimeout(() => r(new Error("FAST_TIMEOUT")), 15000)) ]);
+                const allCols = await Promise.race([ setup.executeQuery(`SELECT table_name, column_name, data_type, comment FROM information_schema.columns WHERE table_schema = \`${safeDb}\` LIMIT ${EXPORT_ROW_LIMIT}`), new Promise((_, r) => setTimeout(() => r(new Error("FAST_TIMEOUT")), 15000)) ]);
                 if (allCols && allCols.length > 0) { allCols.forEach(r => { const override = dbMeta[Object.values(r)[0]]?.[Object.values(r)[1]]; worksheet.addRow({ db: req.body.db, table: Object.values(r)[0], column: Object.values(r)[1], type: Object.values(r)[2] || '', comment: override || Object.values(r)[3] || '' }); }); }
             } catch (err) { console.warn('[Export] Hive info_schema query failed:', err.message); } finally { try{if(setup.session) await setup.session.close();}catch(e){ console.warn('[Export] Hive session close failed:', e.message); } try{if(setup.client) await setup.client.close();}catch(e){ console.warn('[Export] Hive client close failed:', e.message); } }
         }
@@ -3168,6 +3336,7 @@ router.post('/explore/query', requireConnectionAccess('connection_id'), async (r
 
         try {
             if (conn.type === 'hive') await connection.query('SET CATALOG hudi_catalog;');
+            if (db_name && !isValidIdentifier(db_name)) { await connection.end(); return res.status(400).json({ error: 'Invalid database name' }); }
             if (db_name) await connection.query(`USE \`${db_name}\``);
             const [dataRows] = await connection.query(execQuery);
             results = dataRows;
@@ -3211,7 +3380,7 @@ router.post('/explore/table-details', requireConnectionAccess('connection_id'), 
             // 2. Fetch Live Table Size
             if (conn.type === 'starrocks') {
                 try {
-                    const [statusRes] = await connection.query(`SHOW TABLE STATUS FROM \`${db_name}\` LIKE '${table_name}'`);
+                    const [statusRes] = await connection.query('SHOW TABLE STATUS FROM ?? LIKE ?', [db_name, table_name]);
                     if (statusRes && statusRes.length > 0) {
                         const dataLen = parseInt(statusRes[0].Data_length || 0);
                         const indexLen = parseInt(statusRes[0].Index_length || 0);
@@ -3279,6 +3448,184 @@ module.exports = router;
 
 EOF
 
+cat << 'EOF' > "$APP_DIR/backend/routes/lineage.js"
+const express = require('express');
+const router = express.Router();
+const mysql = require('mysql2/promise');
+const { pgPool } = require('../db');
+const { decrypt, getConnConfig } = require('../utils/crypto');
+
+const LAYER_ORDER = ['raw_hudi', 'curated', 'service', 'bi'];
+const LAYER_LABELS = { raw_hudi: 'Raw (Hudi)', curated: 'Curated', service: 'Service', bi: 'BI / Reports' };
+
+const getLayer = (dbName) => {
+    if (/_service(_live|_odoo|_revenue|_odd)?$/.test(dbName)) return 'service';
+    if (/_curated(_live)?$/.test(dbName)) return 'curated';
+    if (/_raw$/.test(dbName)) return 'raw_hudi';
+    return 'raw_hudi';
+};
+
+const getApp = (dbName) => dbName
+    .replace(/_service(_live|_odoo|_revenue|_odd)?$/, '')
+    .replace(/_curated(_live)?$/, '')
+    .replace(/_raw$/, '')
+    .replace(/_live$/, '')
+    .trim();
+
+const isBiTable = (tableName) => /^sr_/i.test(tableName);
+
+const shouldSkipDb = (dbName) => {
+    if (['information_schema', 'sys', '_statistics_', 'starrocks', 'default', 'mysql'].includes(dbName)) return true;
+    if (/^(data_observability|metadata|marts|loinc|omop_cdm|adhoc|test_|mlops|openproject|odoo|task_management|p4m|hcp_camp_services|gayatric|sdp_metadata|fhiruat|fhir_s3)/.test(dbName)) return true;
+    if (/archive/.test(dbName)) return true;
+    return false;
+};
+
+const isValidIdentifier = (name) => typeof name === 'string' && /^[a-zA-Z0-9_\-]+$/.test(name);
+
+const getSrConn = async (host, port, user, password) => {
+    const c = await mysql.createConnection({ host, port: Number(port), user: user || 'root', password: password || '', connectTimeout: 15000 });
+    try { await c.query('SET new_planner_optimize_timeout = 300000;'); } catch (e) {}
+    try { await c.query('SET query_timeout = 300;'); } catch (e) {}
+    return c;
+};
+
+router.post('/real-lineage', async (req, res) => {
+    req.setTimeout(120000);
+    try {
+        const { hive_connection_id, sr_connection_id } = req.body;
+        const nodes = [];
+
+        if (hive_connection_id) {
+            const { rows } = await pgPool.query('SELECT * FROM explorer_connections WHERE id = $1', [hive_connection_id]);
+            if (rows.length) {
+                const conn = rows[0];
+                const cfg = getConnConfig(conn);
+                const db = await getSrConn(conn.host, cfg.port, cfg.user, cfg.password);
+                try {
+                    await db.query('SET CATALOG hudi_catalog;');
+                    const [databases] = await db.query('SHOW DATABASES');
+                    const dbs = databases.map(r => Object.values(r)[0]).filter(d => !shouldSkipDb(d));
+                    for (const dbName of dbs) {
+                        try {
+                            const [tables] = await db.query(`SHOW TABLES FROM \`${dbName}\``);
+                            const layer = getLayer(dbName);
+                            const app = getApp(dbName);
+                            for (const t of tables) {
+                                const tableName = Object.values(t)[0];
+                                nodes.push({ node_id: `hive__${dbName}__${tableName}`, source: 'hive', db_name: dbName, table_name: tableName, layer, application: app });
+                            }
+                        } catch (e) {}
+                    }
+                } finally { await db.end(); }
+            }
+        }
+
+        if (sr_connection_id) {
+            const { rows } = await pgPool.query('SELECT * FROM explorer_connections WHERE id = $1', [sr_connection_id]);
+            if (rows.length) {
+                const conn = rows[0];
+                const db = await getSrConn(conn.host, conn.port, conn.username, decrypt(conn.password));
+                try {
+                    const [databases] = await db.query('SHOW DATABASES');
+                    const dbs = databases.map(r => Object.values(r)[0]).filter(d => !shouldSkipDb(d));
+                    for (const dbName of dbs) {
+                        try {
+                            const [tables] = await db.query(`SHOW TABLES FROM \`${dbName}\``);
+                            const srLayer = getLayer(dbName);
+                            const app = getApp(dbName);
+                            for (const t of tables) {
+                                const tableName = Object.values(t)[0];
+                                const finalLayer = isBiTable(tableName) ? 'bi' : srLayer;
+                                nodes.push({ node_id: `sr__${dbName}__${tableName}`, source: 'starrocks', db_name: dbName, table_name: tableName, layer: finalLayer, application: app });
+                            }
+                        } catch (e) {}
+                    }
+                } finally { await db.end(); }
+            }
+        }
+
+        const byApp = {};
+        nodes.forEach(n => { if (!byApp[n.application]) byApp[n.application] = []; byApp[n.application].push(n); });
+        const edges = [];
+        const edgeSet = new Set();
+        const normalize = (name) => name.replace(/^hv_|^sr_|^hvc_/i, '').replace(/_curated$|_service$|_raw$/, '').toLowerCase();
+
+        Object.values(byApp).forEach(appNodes => {
+            const byLayer = {};
+            LAYER_ORDER.forEach(l => { byLayer[l] = []; });
+            appNodes.forEach(n => { if (!byLayer[n.layer]) byLayer[n.layer] = []; byLayer[n.layer].push(n); });
+            const presentLayers = LAYER_ORDER.filter(l => byLayer[l]?.length > 0);
+            for (let i = 0; i < presentLayers.length - 1; i++) {
+                const srcNodes = byLayer[presentLayers[i]];
+                const tgtNodes = byLayer[presentLayers[i + 1]];
+                if (srcNodes.length <= 2) {
+                    for (const src of srcNodes) {
+                        for (const tgt of tgtNodes) {
+                            const key = `${src.node_id}||${tgt.node_id}`;
+                            if (!edgeSet.has(key)) { edgeSet.add(key); edges.push({ source_node_id: src.node_id, target_node_id: tgt.node_id, transformation_type: 'pipeline' }); }
+                        }
+                    }
+                } else {
+                    for (const src of srcNodes) {
+                        const srcNorm = normalize(src.table_name);
+                        let matched = false;
+                        for (const tgt of tgtNodes) {
+                            const tgtNorm = normalize(tgt.table_name);
+                            if (srcNorm === tgtNorm || tgtNorm.includes(srcNorm) || srcNorm.includes(tgtNorm)) {
+                                const key = `${src.node_id}||${tgt.node_id}`;
+                                if (!edgeSet.has(key)) { edgeSet.add(key); edges.push({ source_node_id: src.node_id, target_node_id: tgt.node_id, transformation_type: 'pipeline' }); matched = true; }
+                            }
+                        }
+                        if (!matched) {
+                            for (const tgt of tgtNodes) {
+                                const key = `${src.node_id}||${tgt.node_id}`;
+                                if (!edgeSet.has(key)) { edgeSet.add(key); edges.push({ source_node_id: src.node_id, target_node_id: tgt.node_id, transformation_type: 'pipeline' }); }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        res.json({ nodes, edges, layer_labels: LAYER_LABELS, total_nodes: nodes.length, total_edges: edges.length });
+    } catch (e) {
+        console.error('[Lineage Real Error]', e.message);
+        res.status(500).json({ error: e.message });
+    }
+});
+
+router.post('/node/columns', async (req, res) => {
+    try {
+        const { connection_id, db_name, table_name, source } = req.body;
+        if (!isValidIdentifier(db_name) || !isValidIdentifier(table_name)) return res.status(400).json({ error: 'Invalid identifier' });
+        const { rows } = await pgPool.query('SELECT * FROM explorer_connections WHERE id = $1', [connection_id]);
+        if (!rows.length) return res.status(404).json({ error: 'Connection not found' });
+        const conn = rows[0];
+        if (source === 'starrocks') {
+            const db = await getSrConn(conn.host, conn.port, conn.username, decrypt(conn.password));
+            try {
+                const [cols] = await db.query(`DESCRIBE \`${db_name}\`.\`${table_name}\``);
+                res.json(cols.map(c => ({ name: c.Field, type: c.Type, key: c.Key === 'true' })));
+            } finally { await db.end(); }
+        } else {
+            const cfg = getConnConfig(conn);
+            const db = await getSrConn(conn.host, cfg.port, cfg.user, cfg.password);
+            try {
+                await db.query('SET CATALOG hudi_catalog;');
+                const [cols] = await db.query(`DESCRIBE \`${db_name}\`.\`${table_name}\``);
+                res.json(cols.map(c => ({ name: c.Field || c.col_name || '', type: c.Type || c.data_type || '', comment: c.Comment || '' })).filter(c => c.name && !c.name.startsWith('#') && !c.name.startsWith('_hoodie')));
+            } finally { await db.end(); }
+        }
+    } catch (e) {
+        console.error('[Node Columns Error]', e.message);
+        res.status(500).json({ error: e.message });
+    }
+});
+
+module.exports = router;
+EOF
+
 cat << 'EOF' > $APP_DIR/backend/routes/home.js
 const express = require('express');
 const router  = express.Router();
@@ -3315,6 +3662,7 @@ async function getTableCountSingle(pool, catalogName, connType) {
             if (rows.length > 0) return rows.filter(r => !TABLE_EXCLUDE_RE.test(r.tbl)).length;
 
             // Fallback: enumerate databases then batch-count tables
+            if (!catalogName || !/^[a-zA-Z0-9_\-]+$/.test(catalogName)) return 0;
             const [dbRows] = await pool.query(`SHOW DATABASES FROM \`${catalogName}\``);
             const dbs = dbRows.map(r => Object.values(r)[0])
                               .filter(d => !SYSTEM_DBS.includes(d.toLowerCase()));
@@ -3364,7 +3712,7 @@ router.get('/stats', async (req, res) => {
                 const airflowDb = new Client({
                     host: conn.host, port: conn.port || 5432, user: conn.username,
                     password: decrypt(conn.password), database: conn.sr_username || 'airflow',
-                    ssl: process.env.NODE_ENV === 'production' ? true : { rejectUnauthorized: false }
+                    ssl: { rejectUnauthorized: false }
                 });
                 try {
                     await airflowDb.connect();
@@ -3450,7 +3798,7 @@ router.post('/global-search', async (req, res) => {
                 const airflowDb = new Client({
                     host: conn.host, port: conn.port || 5432, user: conn.username,
                     password: decrypt(conn.password), database: conn.sr_username || 'airflow',
-                    ssl: process.env.NODE_ENV === 'production' ? true : { rejectUnauthorized: false }
+                    ssl: { rejectUnauthorized: false }
                 });
                 try {
                     await airflowDb.connect();
@@ -3539,6 +3887,288 @@ router.post('/global-search', async (req, res) => {
 module.exports = router;
 EOF
 
+cat << 'EOF' > "$APP_DIR/backend/routes/catalog.js"
+const express = require('express');
+const router = express.Router();
+const { pgPool } = require('../db');
+const mysql = require('mysql2/promise');
+const { decrypt } = require('../utils/crypto');
+const hive = require('hive-driver');
+const { TCLIService, TCLIService_types } = hive.thrift;
+
+const LAYER_ORDER = ['raw_hudi','curated','service','bi'];
+
+const mysqlPoolCache = {};
+const getSrPool = (host, port, user, password) => {
+  const key = `${host}:${port}:${user}`;
+  if (!mysqlPoolCache[key]) {
+    mysqlPoolCache[key] = mysql.createPool({
+      host, port: Number(port), user: user || 'root', password: password || '',
+      connectionLimit: 10, connectTimeout: 15000
+    });
+  }
+  return mysqlPoolCache[key];
+};
+
+class AsyncQueue {
+    constructor(concurrency = 1) {
+        this.concurrency = concurrency;
+        this.running = 0;
+        this.queue = [];
+    }
+    async add(task) {
+        if (this.running >= this.concurrency) {
+            await new Promise(resolve => this.queue.push(resolve));
+        }
+        this.running++;
+        try {
+            return await task();
+        } finally {
+            this.running--;
+            if (this.queue.length > 0) {
+                const next = this.queue.shift();
+                next();
+            }
+        }
+    }
+}
+const hiveThriftQueue = new AsyncQueue(2);
+
+const getLayer = (dbName) => {
+  if (/_service(_live|_odoo|_revenue|_odd)?$/.test(dbName)) return 'service';
+  if (/_curated(_live)?$/.test(dbName)) return 'curated';
+  if (/_raw$/.test(dbName)) return 'raw_hudi';
+  return 'raw_hudi';
+};
+
+const getApp = (dbName) => dbName.replace(/_service(_live|_odoo|_revenue|_odd)?$/, '').replace(/_curated(_live)?$/, '').replace(/_raw$/, '').replace(/_live$/, '').trim();
+
+const isBiTable = (tableName) => /^sr_/i.test(tableName);
+const HIVE_QUERY_TIMEOUT_MS = 15000;
+
+const shouldSkipDb = (dbName) => {
+  if (['information_schema','sys','_statistics_','starrocks','default','mysql'].includes(dbName)) return true;
+  if (/^(data_observability|metadata|marts|loinc|omop_cdm|adhoc|test_|mlops|openproject|odoo|task_management|p4m|hcp_camp_services|gayatric|sdp_metadata|fhiruat|fhir_s3)/i.test(dbName)) return true;
+  if (/archive/i.test(dbName)) return true;
+  return false;
+};
+
+const withTimeout = async (promise, ms, label) => {
+  let timer;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+};
+
+const setupHiveClient = async (conn) => {
+  const host = conn.host; const port = Number(conn.port) || 10000;
+  const authUser = (conn.username && conn.username.trim()) ? conn.username.trim() : (process.env.HIVE_DEFAULT_USER || 'hadoop');
+  const authPass = conn.password ? decrypt(conn.password) : '';
+  let client = new hive.HiveClient(TCLIService, TCLIService_types);
+  client.on('error', () => {});
+  try {
+    await client.connect({ host, port }, new hive.connections.TcpConnection(), new hive.auth.PlainTcpAuthentication({ username: authUser, password: authPass }));
+  } catch (e) {
+    client = new hive.HiveClient(TCLIService, TCLIService_types);
+    client.on('error', () => {});
+    await client.connect({ host, port }, new hive.connections.TcpConnection(), new hive.auth.NoSaslAuthentication({ username: authUser, password: authPass }));
+  }
+  const session = await withTimeout(client.openSession({ client_protocol: TCLIService_types.TProtocolVersion.HIVE_CLI_SERVICE_PROTOCOL_V10 }), 10000, 'Hive openSession');
+  const utils = new hive.HiveUtils(TCLIService_types);
+  const executeQuery = async (query) => {
+    const op = await session.executeStatement(query);
+    await utils.waitUntilReady(op, false, () => {});
+    await utils.fetchAll(op);
+    const result = utils.getResult(op).getValue();
+    await op.close();
+    return result;
+  };
+  return { client, session, executeQuery };
+};
+
+router.post('/real-lineage', async (req, res) => {
+  let hiveSetup;
+  try {
+    const { hive_connection_id, sr_connection_id } = req.body;
+    const nodes = [];
+
+    let srDbConfig = null;
+    if (sr_connection_id) {
+      const { rows } = await pgPool.query('SELECT * FROM explorer_connections WHERE id = $1', [sr_connection_id]);
+      if (rows.length) {
+        srDbConfig = rows[0];
+        const pool = getSrPool(rows[0].host, rows[0].port, rows[0].username, decrypt(rows[0].password));
+        const srDb = await pool.getConnection();
+        try {
+          await srDb.query('SET CATALOG default_catalog;');
+          const [srTables] = await srDb.query(`SELECT TABLE_SCHEMA as db, TABLE_NAME as tbl FROM information_schema.tables WHERE TABLE_SCHEMA NOT IN ('information_schema', 'sys', '_statistics_', 'mysql', 'performance_schema', 'starrocks', 'default')`);
+          for (const r of srTables) {
+            if (!shouldSkipDb(r.db)) {
+              nodes.push({ node_id: `sr__${r.db}__${r.tbl}`, source: 'starrocks', db_name: r.db, table_name: r.tbl, layer: isBiTable(r.tbl) ? 'bi' : getLayer(r.db), application: getApp(r.db) });
+            }
+          }
+        } catch(e) {
+          console.warn(`[Lineage] StarRocks info_schema query failed: ${e.message}`);
+        } finally {
+          srDb.release();
+        }
+      }
+    }
+
+    if (hive_connection_id) {
+      const { rows } = await pgPool.query('SELECT * FROM explorer_connections WHERE id = $1', [hive_connection_id]);
+      if (rows.length) {
+        let fetchedViaSr = false;
+        if (srDbConfig) {
+            const pool = getSrPool(srDbConfig.host, srDbConfig.port, srDbConfig.username, decrypt(srDbConfig.password));
+            const srDb = await pool.getConnection();
+            try {
+                await srDb.query('SET CATALOG hudi_catalog;');
+                const [dbs] = await srDb.query('SHOW DATABASES');
+                const dbNames = dbs.map(r => Object.values(r)[0]).filter(d => !shouldSkipDb(d));
+                for (const dbName of dbNames) {
+                    const [tbls] = await srDb.query(`SHOW TABLES FROM \`${dbName}\``);
+                    for (const t of tbls) {
+                        const tblName = Object.values(t)[0];
+                        nodes.push({ node_id: `hive__${dbName}__${tblName}`, source: 'hive', db_name: dbName, table_name: tblName, layer: getLayer(dbName), application: getApp(dbName) });
+                    }
+                }
+                fetchedViaSr = true;
+            } catch(e) {
+                console.warn(`[Lineage] StarRocks hudi_catalog fetch failed, falling back to Hive Thrift: ${e.message}`);
+            } finally {
+                try { await srDb.query('SET CATALOG default_catalog;'); } catch(e){}
+                srDb.release();
+            }
+        }
+
+        if (!fetchedViaSr) {
+            hiveSetup = await setupHiveClient(rows[0]);
+            const dbs = await withTimeout(hiveSetup.executeQuery('SHOW DATABASES'), HIVE_QUERY_TIMEOUT_MS, 'Hive SHOW DATABASES');
+            for (const r of dbs) {
+              const dbName = Object.values(r)[0];
+              if (shouldSkipDb(dbName)) continue;
+              try {
+                const tRows = await withTimeout(hiveSetup.executeQuery(`SHOW TABLES IN \`${dbName}\``), HIVE_QUERY_TIMEOUT_MS, `Hive SHOW TABLES IN ${dbName}`);
+                const tables = tRows.map(tr => Object.values(tr)[Object.values(tr).length - 1]);
+                for (const tableName of tables) {
+                  nodes.push({ node_id: `hive__${dbName}__${tableName}`, source: 'hive', db_name: dbName, table_name: tableName, layer: getLayer(dbName), application: getApp(dbName) });
+                }
+              } catch(e) {
+                console.warn(`[Lineage] Skipping Hive database ${dbName}: ${e.message}`);
+                break;
+              }
+            }
+        }
+      }
+    }
+
+    const byApp = {}; nodes.forEach(n => { if (!byApp[n.application]) byApp[n.application] = []; byApp[n.application].push(n); });
+    const edges = []; const edgeSet = new Set();
+
+    Object.values(byApp).forEach(appNodes => {
+      const byLayer = {}; LAYER_ORDER.forEach(l => { byLayer[l] = []; });
+      appNodes.forEach(n => byLayer[n.layer].push(n));
+      const presentLayers = LAYER_ORDER.filter(l => byLayer[l].length > 0);
+
+      for (let i = 0; i < presentLayers.length - 1; i++) {
+        const srcNodes = byLayer[presentLayers[i]]; const tgtNodes = byLayer[presentLayers[i + 1]];
+            for (const src of srcNodes) {
+              for (const tgt of tgtNodes) {
+                const key = `${src.node_id}||${tgt.node_id}`;
+                if (!edgeSet.has(key)) {
+                  edgeSet.add(key);
+                  edges.push({ source_node_id: src.node_id, target_node_id: tgt.node_id, transformation_type: 'pipeline' });
+                }
+              }
+            }
+      }
+    });
+
+    res.json({ nodes, edges, total_nodes: nodes.length, total_edges: edges.length });
+  } catch (e) {
+    console.error('[Lineage Error]', e.message);
+    res.status(500).json({ error: e.message });
+  } finally {
+    try { if (hiveSetup?.session) await hiveSetup.session.close(); } catch(e) {}
+    try { if (hiveSetup?.client) await hiveSetup.client.close(); } catch(e) {}
+  }
+});
+
+router.post('/node/columns', async (req, res) => {
+  try {
+    const { connection_id, db_name, table_name, source } = req.body;
+    const { rows } = await pgPool.query('SELECT * FROM explorer_connections WHERE id = $1', [connection_id]);
+    if (!rows.length) return res.status(404).json({ error: 'Not found' });
+    const conn = rows[0];
+
+    if (source === 'starrocks') {
+      const pool = getSrPool(conn.host, conn.port, conn.username, decrypt(conn.password));
+      const srDb = await pool.getConnection();
+      try {
+          await srDb.query('SET CATALOG default_catalog;');
+          const [cols] = await srDb.query(`DESCRIBE \`${db_name}\`.\`${table_name}\``);
+          return res.json(cols.map(c => ({ name: c.Field, type: c.Type ? c.Type.toLowerCase() : c.Type })));
+      } finally {
+          srDb.release();
+      }
+    } else {
+      const { rows: srRows } = await pgPool.query("SELECT * FROM explorer_connections WHERE type = 'starrocks' LIMIT 1");
+      if (srRows.length) {
+        try {
+           const srConn = srRows[0];
+           const pool = getSrPool(srConn.host, srConn.port, srConn.username, decrypt(srConn.password));
+           const srDb = await pool.getConnection();
+           try {
+               await srDb.query('SET CATALOG hudi_catalog;');
+               const [cols] = await srDb.query(`DESCRIBE \`${db_name}\`.\`${table_name}\``);
+               const filteredCols = cols.map(c => {
+                   let t = c.Type ? c.Type.toLowerCase() : c.Type;
+                   if (t && (t.startsWith('varchar') || t.startsWith('char'))) t = 'string';
+                   return { name: c.Field ? c.Field.toLowerCase() : c.Field, type: t };
+               }).filter(c => c.name && !c.name.startsWith('_hoodie_'));
+               
+               if (filteredCols.length > 0) return res.json(filteredCols);
+               throw new Error('StarRocks returned 0 columns');
+           } finally {
+               try { await srDb.query('SET CATALOG default_catalog;'); } catch(e){}
+               srDb.release();
+           }
+        } catch(e) {
+           console.warn('[Lineage] Fast Hive column fetch via SR failed, using native Thrift:', e.message);
+        }
+      }
+
+      const fetchViaThrift = async () => {
+          const setup = await setupHiveClient(conn);
+          const r = await withTimeout(setup.executeQuery(`DESCRIBE \`${db_name}\`.\`${table_name}\``), 30000, `DESCRIBE ${table_name}`);
+          try{await setup.session.close();}catch(e){} try{await setup.client.close();}catch(e){}
+          return r.map(row => { 
+              const v = Object.values(row); 
+              let t = v[1] ? String(v[1]).toLowerCase() : v[1];
+              if (t && (t.startsWith('varchar') || t.startsWith('char'))) t = 'string';
+              return { name: v[0] ? String(v[0]).toLowerCase() : v[0], type: t };
+          }).filter(c => c.name && !c.name.startsWith('#') && !c.name.startsWith('_hoodie_'));
+      };
+
+      const columns = await hiveThriftQueue.add(fetchViaThrift);
+      return res.json(columns);
+    }
+  } catch (e) { 
+      res.status(500).json({ error: e.message }); 
+  }
+});
+
+module.exports = router;
+EOF
+
 cat << 'EOF' > "$APP_DIR/backend/server.js"
 require('dotenv').config();
 const express = require('express');
@@ -3564,6 +4194,7 @@ const homeRoutes        = require('./routes/home');
 const auditRoutes       = require('./routes/audit');
 const adminRoutes       = require('./routes/admin');
 const datawizzRoutes    = require('./routes/datawizz');
+const lineageRoutes     = require('./routes/lineage');
 
 // ─── Startup guards ───────────────────────────────────────────────────────────
 const REQUIRED_ENV = ['JWT_SECRET', 'ENCRYPTION_KEY', 'PG_USER', 'PG_HOST',
@@ -3586,7 +4217,7 @@ app.use(helmet({
     contentSecurityPolicy: {
         directives: {
             defaultSrc:  ["'self'"],
-            scriptSrc:   ["'self'", "'unsafe-inline'", "cdnjs.cloudflare.com"],
+            scriptSrc:   ["'self'", "cdnjs.cloudflare.com"],
             styleSrc:    ["'self'", "'unsafe-inline'", "cdnjs.cloudflare.com", "fonts.googleapis.com"],
             fontSrc:     ["'self'", "cdnjs.cloudflare.com", "fonts.gstatic.com"],
             imgSrc:      ["'self'", "data:", "blob:"],
@@ -3601,45 +4232,6 @@ app.use(helmet({
 
 // Gzip/Brotli compression for all responses
 app.use(compression());
-
-// ─── Rate limiters ────────────────────────────────────────────────────────────
-app.use('/api/', rateLimit({
-    windowMs: 15 * 60 * 1000,
-    max: 300,
-    message: { error: 'Too many requests. Please try again later.' },
-    standardHeaders: true, legacyHeaders: false,
-}));
-app.use('/api/auth/', rateLimit({
-    windowMs: 15 * 60 * 1000,
-    max: 15,
-    message: { error: 'Too many login attempts. Please try again in 15 minutes.' },
-    standardHeaders: true, legacyHeaders: false,
-}));
-app.use('/api/admin/', rateLimit({
-    windowMs: 15 * 60 * 1000,
-    max: 60,
-    message: { error: 'Too many admin requests. Please try again later.' },
-    standardHeaders: true, legacyHeaders: false,
-}));
-app.use('/api/table-metadata/', rateLimit({
-    windowMs: 15 * 60 * 1000,
-    max: 100,
-    message: { error: 'Too many metadata requests. Please try again later.' },
-    standardHeaders: true, legacyHeaders: false,
-}));
-// Strict rate limit for heavy export/build operations (max 5/hour per IP)
-app.use('/api/explore/export/', rateLimit({
-    windowMs: 60 * 60 * 1000,
-    max: 5,
-    message: { error: 'Export rate limit exceeded. Please wait before exporting again.' },
-    standardHeaders: true, legacyHeaders: false,
-}));
-app.use('/api/datawizz/build', rateLimit({
-    windowMs: 60 * 60 * 1000,
-    max: 10,
-    message: { error: 'Dashboard build rate limit exceeded. Please wait.' },
-    standardHeaders: true, legacyHeaders: false,
-}));
 
 // ─── CORS ─────────────────────────────────────────────────────────────────────
 const os = require('os');
@@ -3683,11 +4275,53 @@ app.use(cors({
     credentials: true
 }));
 
+// ─── Rate limiters ────────────────────────────────────────────────────────────
+app.use('/api/', rateLimit({
+    windowMs: 15 * 60 * 1000,
+    max: 2000,
+    message: { error: 'Too many requests. Please try again later.' },
+    standardHeaders: true, legacyHeaders: false,
+}));
+app.use('/api/auth/', rateLimit({
+    windowMs: 15 * 60 * 1000,
+    max: 15,
+    message: { error: 'Too many login attempts. Please try again in 15 minutes.' },
+    standardHeaders: true, legacyHeaders: false,
+}));
+app.use('/api/admin/', rateLimit({
+    windowMs: 15 * 60 * 1000,
+    max: 300,
+    message: { error: 'Too many admin requests. Please try again later.' },
+    standardHeaders: true, legacyHeaders: false,
+}));
+app.use('/api/table-metadata/', rateLimit({
+    windowMs: 15 * 60 * 1000,
+    max: 500,
+    message: { error: 'Too many metadata requests. Please try again later.' },
+    standardHeaders: true, legacyHeaders: false,
+}));
+// Strict rate limit for heavy export/build operations (max 5/hour per IP)
+app.use('/api/explore/export/', rateLimit({
+    windowMs: 60 * 60 * 1000,
+    max: 5,
+    message: { error: 'Export rate limit exceeded. Please wait before exporting again.' },
+    standardHeaders: true, legacyHeaders: false,
+}));
+app.use('/api/datawizz/build', rateLimit({
+    windowMs: 60 * 60 * 1000,
+    max: 10,
+    message: { error: 'Dashboard build rate limit exceeded. Please wait.' },
+    standardHeaders: true, legacyHeaders: false,
+}));
+
 // ─── Cookie parser ────────────────────────────────────────────────────────────
 app.use(cookieParser());
 
 // ─── Body parsing ─────────────────────────────────────────────────────────────
-app.use(express.json({ limit: '5mb' }));
+app.use(express.json({
+    limit: '5mb',
+    verify: (req, _res, buf) => { req.rawBody = buf; },
+}));
 
 // ─── Response size guard (FIX #22) ───────────────────────────────────────────
 // Caps JSON responses at 10 MB to prevent unbounded payload growth
@@ -3766,7 +4400,11 @@ app.post('/api/auth/login', async (req, res) => {
         if (!username || !password) return res.status(400).json({ error: 'Username and password required.' });
 
         const { rows } = await pgPool.query('SELECT * FROM explorer_users WHERE username = $1', [username]);
-        const valid = rows.length > 0 && await bcrypt.compare(password, rows[0].password);
+        // Always run bcrypt — even for missing users — to prevent timing-based username enumeration.
+        const DUMMY_HASH = '$2b$12$invalidhashpaddingtomatchbcryptlengthXXXXXXXXXXXXXXXXXX';
+        const hashToCheck = rows.length > 0 ? rows[0].password : DUMMY_HASH;
+        const passwordMatch = await bcrypt.compare(password, hashToCheck);
+        const valid = rows.length > 0 && passwordMatch;
         if (!valid) return res.status(401).json({ error: 'Invalid credentials.' });
 
         const user = rows[0];
@@ -3801,11 +4439,30 @@ app.post('/api/auth/signup', async (req, res) => {
     }
 });
 
-// ─── Webhook (shared secret, no JWT) ─────────────────────────────────────────
+// ─── Webhook (HMAC-SHA256 + timestamp replay protection) ─────────────────────
 app.use('/api/observability/webhook', (req, res, next) => {
-    const secret = req.headers['x-webhook-secret'];
-    if (!process.env.WEBHOOK_SECRET || secret !== process.env.WEBHOOK_SECRET) {
-        return res.status(401).json({ error: 'Unauthorized: invalid or missing webhook secret.' });
+    const sig = req.headers['x-webhook-signature'];
+    const ts  = req.headers['x-webhook-timestamp'];
+    if (!sig || !ts) {
+        return res.status(401).json({ error: 'Missing X-Webhook-Signature or X-Webhook-Timestamp header.' });
+    }
+    const age = Math.abs(Date.now() - Number(ts));
+    if (isNaN(age) || age > 5 * 60 * 1000) {
+        return res.status(401).json({ error: 'Webhook timestamp expired or invalid.' });
+    }
+    const rawBody = req.rawBody?.toString() || '';
+    const expected = crypto
+        .createHmac('sha256', process.env.WEBHOOK_SECRET || '')
+        .update(`${ts}.${rawBody}`)
+        .digest('hex');
+    let valid = false;
+    try {
+        const sigBuf = Buffer.from(sig,      'hex');
+        const expBuf = Buffer.from(expected, 'hex');
+        valid = sigBuf.length === expBuf.length && crypto.timingSafeEqual(sigBuf, expBuf);
+    } catch (_) { valid = false; }
+    if (!valid) {
+        return res.status(401).json({ error: 'Invalid webhook signature.' });
     }
     next();
 }, observabilityRoutes);
@@ -3872,6 +4529,7 @@ app.use('/api/observability', enforceAuth, observabilityRoutes);
 app.use('/api/audit',         enforceAuth, auditRoutes);
 app.use('/api/admin',         enforceAuth, adminRoutes);
 app.use('/api/datawizz',      enforceAuth, datawizzRoutes);
+app.use('/api/lineage',       enforceAuth, lineageRoutes);
 app.use('/api',               enforceAuth, exploreRoutes);
 
 // ─── Centralised error handler ────────────────────────────────────────────────
@@ -5535,6 +6193,9 @@ export default function Sidebar() {
                 <button onClick={() => navigate('/explore', { state: isActive('/explore') ? location.state : null })} className={`w-full flex items-center gap-3 px-4 py-3 rounded-lg font-bold text-sm transition-all ${isActive('/explore') ? 'bg-indigo-600 text-white shadow-md shadow-indigo-200' : 'text-gray-600 hover:bg-white hover:text-indigo-600'}`}>
                     <i className="fas fa-compass w-5 text-center text-lg"></i> Explore
                 </button>
+                <button onClick={() => navigate('/lineage')} className={`w-full flex items-center gap-3 px-4 py-3 rounded-lg font-bold text-sm transition-all ${isActive('/lineage') ? 'bg-indigo-600 text-white shadow-md shadow-indigo-200' : 'text-gray-600 hover:bg-white hover:text-indigo-600'}`}>
+                    <i className="fas fa-project-diagram w-5 text-center text-lg"></i> Lineage
+                </button>
                 <button onClick={() => navigate('/audit')} className={`w-full flex items-center gap-3 px-4 py-3 rounded-lg font-bold text-sm transition-all ${isActive('/audit') ? 'bg-indigo-600 text-white shadow-md shadow-indigo-200' : 'text-gray-600 hover:bg-white hover:text-indigo-600'}`}>
                     <i className="fas fa-clipboard-check w-5 text-center text-lg"></i> Audit
                 </button>
@@ -5562,78 +6223,7 @@ export default function Sidebar() {
     );
 }
 
-import React from 'react';
-import { useNavigate, useLocation } from 'react-router-dom';
-
-export default function Sidebar() {
-    const navigate = useNavigate();
-    const location = useLocation();
-
-    const isActive = (path) => location.pathname.startsWith(path);
-
-    const user = (() => {
-        try { return JSON.parse(localStorage.getItem('user') || '{}'); }
-        catch(e) { return {}; }
-    })();
-
-    const handleLogout = async () => {
-        try { await fetch('/api/auth/logout', { method: 'POST', credentials: 'include' }); } catch {}
-        localStorage.removeItem('user');
-        navigate('/login', { replace: true });
-    };
-
-    const avatarLetter = (user.username || 'U')[0].toUpperCase();
-    const roleBadge = user.role === 'admin' ? 'bg-indigo-100 text-indigo-700' : 'bg-gray-100 text-gray-500';
-
-    return (
-        <div className="w-64 bg-gray-50 border-r border-gray-200 flex flex-col z-30 shrink-0 shadow-sm">
-            <div className="h-20 flex items-center px-6 border-b border-gray-200 shrink-0">
-                <div className="flex items-center gap-3">
-                    <div className="w-9 h-9 bg-indigo-600 rounded-lg flex items-center justify-center shadow-md">
-                        <i className="fas fa-layer-group text-white text-lg"></i>
-                    </div>
-                    <span className="text-xl font-extrabold text-gray-800 tracking-tight">SDP Metadata</span>
-                </div>
-            </div>
-            <div className="p-4 space-y-2 flex-1">
-                <button onClick={() => navigate('/home')} className={`w-full flex items-center gap-3 px-4 py-3 rounded-lg font-bold text-sm transition-all ${isActive('/home') ? 'bg-indigo-600 text-white shadow-md shadow-indigo-200' : 'text-gray-600 hover:bg-white hover:text-indigo-600'}`}>
-                    <i className="fas fa-home w-5 text-center text-lg"></i> Home
-                </button>
-                <button onClick={() => navigate('/connections')} className={`w-full flex items-center gap-3 px-4 py-3 rounded-lg font-bold text-sm transition-all ${isActive('/connections') ? 'bg-indigo-600 text-white shadow-md shadow-indigo-200' : 'text-gray-600 hover:bg-white hover:text-indigo-600'}`}>
-                    <i className="fas fa-network-wired w-5 text-center text-lg"></i> Connections
-                </button>
-                <button onClick={() => navigate('/explore', { state: isActive('/explore') ? location.state : null })} className={`w-full flex items-center gap-3 px-4 py-3 rounded-lg font-bold text-sm transition-all ${isActive('/explore') ? 'bg-indigo-600 text-white shadow-md shadow-indigo-200' : 'text-gray-600 hover:bg-white hover:text-indigo-600'}`}>
-                    <i className="fas fa-compass w-5 text-center text-lg"></i> Explore
-                </button>
-                <button onClick={() => navigate('/audit')} className={`w-full flex items-center gap-3 px-4 py-3 rounded-lg font-bold text-sm transition-all ${isActive('/audit') ? 'bg-indigo-600 text-white shadow-md shadow-indigo-200' : 'text-gray-600 hover:bg-white hover:text-indigo-600'}`}>
-                    <i className="fas fa-clipboard-check w-5 text-center text-lg"></i> Audit
-                </button>
-                <button onClick={() => navigate('/datawizz')} className={`w-full flex items-center gap-3 px-4 py-3 rounded-lg font-bold text-sm transition-all ${isActive('/datawizz') ? 'bg-emerald-600 text-white shadow-md shadow-emerald-200' : 'text-gray-600 hover:bg-white hover:text-emerald-600'}`}>
-                    <i className="fas fa-chart-pie w-5 text-center text-lg"></i> Data Wizz
-                </button>
-                {user.role === 'admin' && (
-                    <button onClick={() => navigate('/admin/users')} className={`w-full flex items-center gap-3 px-4 py-3 rounded-lg font-bold text-sm transition-all ${isActive('/admin') ? 'bg-indigo-600 text-white shadow-md shadow-indigo-200' : 'text-gray-600 hover:bg-white hover:text-indigo-600'}`}>
-                        <i className="fas fa-users-cog w-5 text-center text-lg"></i> Users
-                    </button>
-                )}
-            </div>
-            <div className="p-4 border-t border-gray-200 shrink-0">
-                <div className="flex items-center gap-3 px-3 py-2 rounded-lg bg-white border border-gray-100 shadow-sm">
-                    <div className="w-8 h-8 bg-gradient-to-br from-indigo-500 to-purple-600 rounded-full flex items-center justify-center text-white font-bold text-sm shadow-inner shrink-0">
-                        {avatarLetter}
-                    </div>
-                    <div className="flex flex-col min-w-0 flex-1">
-                        <span className="text-sm font-bold text-gray-800 leading-tight truncate">{user.username || 'Unknown'}</span>
-                        <span className={`text-[10px] font-semibold uppercase tracking-widest px-1.5 py-0.5 rounded w-fit mt-0.5 ${roleBadge}`}>{user.role || 'viewer'}</span>
-                    </div>
-                    <button onClick={handleLogout} title="Sign out" className="text-gray-400 hover:text-red-500 transition-colors shrink-0 ml-1">
-                        <i className="fas fa-sign-out-alt text-sm"></i>
-                    </button>
-                </div>
-            </div>
-        </div>
-    );
-}
+EOF
 
 cat << 'EOF' > "$APP_DIR/frontend/src/components/GenericTable.jsx"
 import React from 'react';
@@ -5702,6 +6292,7 @@ import Login from './pages/Login';
 import Signup from './pages/Signup';
 import AdminUsers from './pages/AdminUsers';
 import DataWizz from './pages/DataWizz';
+import Lineage from './pages/Lineage';
 
 function ProtectedRoute({ children }) {
     const user = localStorage.getItem('user');
@@ -5744,6 +6335,7 @@ function App() {
                     <Route path="/connections" element={<ProtectedRoute><AppLayout><Connections /></AppLayout></ProtectedRoute>} />
                     <Route path="/explore" element={<ProtectedRoute><AppLayout><Explore /></AppLayout></ProtectedRoute>} />
                     <Route path="/audit" element={<ProtectedRoute><AppLayout><Audit /></AppLayout></ProtectedRoute>} />
+                    <Route path="/lineage" element={<ProtectedRoute><AppLayout><Lineage /></AppLayout></ProtectedRoute>} />
                     <Route path="/admin/users" element={<AdminRoute><AppLayout><AdminUsers /></AppLayout></AdminRoute>} />
                     <Route path="/datawizz" element={<ProtectedRoute><DataWizz /></ProtectedRoute>} />
                     <Route path="*" element={<Navigate to="/" replace />} />
@@ -6674,818 +7266,7 @@ export default function DataWizz() {
     );
 }
 
-import { useState, useEffect, useRef, useCallback } from 'react';
-import { useNavigate } from 'react-router-dom';
-import api, { API } from '../utils/api';
-
-// ── SSE over GET ──────────────────────────────────────────────────────────────
-function useSSE() {
-    const [logs, setLogs] = useState([]);
-    const [isStreaming, setIsStreaming] = useState(false);
-    const [result, setResult] = useState(null);
-    const [error, setError] = useState(null);
-    const ctrlRef = useRef(null);
-
-    const stop = useCallback(() => {
-        ctrlRef.current?.abort();
-        ctrlRef.current = null;
-        setIsStreaming(false);
-    }, []);
-
-    const start = useCallback((url) => {
-        stop();
-        setLogs([]);
-        setResult(null);
-        setError(null);
-        setIsStreaming(true);
-        const ctrl = new AbortController();
-        ctrlRef.current = ctrl;
-        fetch(url, { credentials: 'include', signal: ctrl.signal })
-            .then(async (resp) => {
-                const reader = resp.body.getReader();
-                const decoder = new TextDecoder();
-                let buf = '';
-                while (true) {
-                    const { value, done } = await reader.read();
-                    if (done) break;
-                    buf += decoder.decode(value, { stream: true });
-                    const parts = buf.split('\n\n');
-                    buf = parts.pop();
-                    for (const part of parts) {
-                        const line = part.replace(/^data: /, '').trim();
-                        if (!line) continue;
-                        try {
-                            const ev = JSON.parse(line);
-                            if (ev.type === 'progress') setLogs(p => [...p, ev]);
-                            else if (ev.type === 'done') { setResult(ev); setIsStreaming(false); }
-                            else if (ev.type === 'error') { setError(ev.message); setIsStreaming(false); }
-                        } catch { }
-                    }
-                }
-                setIsStreaming(false);
-            })
-            .catch(err => { if (err.name !== 'AbortError') { setError(err.message); setIsStreaming(false); } });
-    }, [stop]);
-
-    useEffect(() => () => stop(), [stop]);
-    return { logs, isStreaming, result, error, start, stop };
-}
-
-// ── Terminal Log ──────────────────────────────────────────────────────────────
-function Terminal({ logs, streaming, error, emptyText = 'Waiting...' }) {
-    const endRef = useRef(null);
-    useEffect(() => { endRef.current?.scrollIntoView({ behavior: 'smooth' }); }, [logs]);
-
-    return (
-        <div className="bg-gray-900 rounded-2xl border border-gray-200 p-5 font-mono text-xs overflow-y-auto max-h-72 min-h-[120px]">
-            {!logs.length && !streaming && !error && (
-                <p className="text-gray-500 italic">{emptyText}</p>
-            )}
-            {logs.map((log, i) => (
-                <div key={i} className="flex items-start gap-3 mb-2">
-                    <span className="text-gray-500 shrink-0 w-4">{log.step || '·'}</span>
-                    <span className="text-emerald-400 leading-relaxed">{log.message}</span>
-                </div>
-            ))}
-            {streaming && (
-                <div className="flex items-center gap-2 text-violet-400 mt-1">
-                    <span className="inline-block w-2 h-2 bg-violet-400 rounded-full animate-pulse"></span>
-                    processing…
-                </div>
-            )}
-            {error && (
-                <div className="text-rose-400 mt-2 flex items-start gap-2">
-                    <span className="shrink-0">✗</span> {error}
-                </div>
-            )}
-            <div ref={endRef} />
-        </div>
-    );
-}
-
-// ── Step pill ─────────────────────────────────────────────────────────────────
-function StepPill({ n, label, active, done, onClick }) {
-    return (
-        <button
-            onClick={onClick}
-            disabled={!done && !active}
-            className={`w-full flex items-center gap-3 px-4 py-3 rounded-lg text-left transition-all duration-200 font-bold text-sm
-                ${active
-                    ? 'bg-emerald-600 text-white shadow-md shadow-emerald-200'
-                    : done
-                        ? 'text-gray-600 hover:bg-white hover:text-emerald-600 cursor-pointer'
-                        : 'text-gray-400 cursor-not-allowed opacity-50'}`}
-        >
-            <div className={`w-6 h-6 rounded-full flex items-center justify-center shrink-0 text-xs font-bold transition-all
-                ${active ? 'bg-white/20 text-white' : done ? 'bg-emerald-100 text-emerald-600' : 'bg-gray-100 text-gray-400'}`}>
-                {done && !active ? <i className="fas fa-check text-[10px]"></i> : n}
-            </div>
-            <span>{label}</span>
-        </button>
-    );
-}
-
-// Safe stringify helper
-const safeStr = (v) => {
-    if (v == null) return '';
-    if (typeof v === 'string') return v;
-    if (typeof v === 'number' || typeof v === 'boolean') return String(v);
-    return JSON.stringify(v);
-};
-
-// Format a QA issue/suggestion that may be a string or an LLM-returned object
-const fmtQA = (v) => {
-    if (v == null) return '';
-    if (typeof v === 'string') return v;
-    if (typeof v === 'object') {
-        const parts = [];
-        if (v.chart_title) parts.push('[' + v.chart_title + ']');
-        if (v.issue || v.message) parts.push(v.issue || v.message);
-        if (v.details) parts.push(v.details);
-        return parts.join(' -- ') || JSON.stringify(v);
-    }
-    return String(v);
-};
-
-// ── Chart Card ────────────────────────────────────────────────────────────────
-function ChartCard({ chart }) {
-    const VIZ = {
-        big_number_total:       { icon: 'fa-hashtag',    color: 'text-emerald-600', bg: 'bg-emerald-50 border-emerald-200' },
-        echarts_timeseries_line:{ icon: 'fa-chart-line', color: 'text-sky-600',     bg: 'bg-sky-50 border-sky-200'         },
-        bar:                    { icon: 'fa-chart-bar',  color: 'text-violet-600',  bg: 'bg-violet-50 border-violet-200'   },
-        pie:                    { icon: 'fa-chart-pie',  color: 'text-pink-600',    bg: 'bg-pink-50 border-pink-200'       },
-        table:                  { icon: 'fa-table',      color: 'text-gray-600',    bg: 'bg-gray-50 border-gray-200'       },
-        scatter:                { icon: 'fa-braille',    color: 'text-amber-600',   bg: 'bg-amber-50 border-amber-200'     },
-        echarts_scatter:        { icon: 'fa-braille',    color: 'text-amber-600',   bg: 'bg-amber-50 border-amber-200'     },
-    };
-    const v = VIZ[chart.viz_type] || { icon: 'fa-chart-area', color: 'text-gray-500', bg: 'bg-gray-50 border-gray-200' };
-    const metrics = (chart.metrics || []).map(m => m.label || `${m.aggregate}(${m.column?.column_name})`);
-
-    return (
-        <div className="bg-white border border-gray-200 rounded-2xl p-4 hover:border-emerald-200 hover:shadow-sm transition-all">
-            <div className="flex items-start gap-3">
-                <div className={`w-9 h-9 rounded-xl border flex items-center justify-center shrink-0 ${v.bg}`}>
-                    <i className={`fas ${v.icon} ${v.color} text-sm`}></i>
-                </div>
-                <div className="flex-1 min-w-0">
-                    <div className="flex items-center justify-between gap-2 mb-0.5">
-                        <h4 className="text-gray-800 text-sm font-bold truncate">{chart.title}</h4>
-                        <span className="text-[9px] font-bold bg-gray-100 text-gray-400 px-1.5 py-0.5 rounded uppercase tracking-wider shrink-0">w{chart.width}</span>
-                    </div>
-                    <p className={`text-[10px] font-bold uppercase tracking-widest mb-1.5 ${v.color}`}>{chart.viz_type}</p>
-                    {metrics.length > 0 && <p className="text-[11px] text-gray-500"><span className="text-gray-600">Metrics:</span> {metrics.join(', ')}</p>}
-                    {chart.groupby?.length > 0 && <p className="text-[11px] text-gray-500"><span className="text-gray-600">Group by:</span> {chart.groupby.join(', ')}</p>}
-                    {chart.reasoning && <p className="text-[10px] text-gray-400 mt-1.5 italic leading-relaxed">{chart.reasoning}</p>}
-                </div>
-            </div>
-        </div>
-    );
-}
-
-// ── Field ─────────────────────────────────────────────────────────────────────
-function Field({ label, hint, children }) {
-    return (
-        <div>
-            <label className="block text-[11px] font-bold text-gray-500 uppercase tracking-widest mb-1.5">
-                {label} {hint && <span className="normal-case font-normal text-gray-400">{hint}</span>}
-            </label>
-            {children}
-        </div>
-    );
-}
-
-const INPUT = "w-full bg-gray-50 border border-gray-200 text-gray-800 placeholder-gray-400 px-4 py-2.5 rounded-xl focus:outline-none focus:border-emerald-400 focus:ring-2 focus:ring-emerald-100 transition-all text-sm font-medium";
-const SELECT = "w-full bg-gray-50 border border-gray-200 text-gray-800 px-4 py-2.5 rounded-xl focus:outline-none focus:border-emerald-400 focus:ring-2 focus:ring-emerald-100 transition-all text-sm font-medium disabled:opacity-40 appearance-none cursor-pointer";
-
-// ── Main Component ────────────────────────────────────────────────────────────
-export default function DataWizz() {
-    const navigate = useNavigate();
-    const [step, setStep] = useState(1);
-
-    // Step 1 — source
-    const [connections, setConnections] = useState([]);
-    const [selConn, setSelConn] = useState(null);
-    const [databases, setDatabases] = useState([]);
-    const [selDb, setSelDb] = useState('');
-    const [tables, setTables] = useState([]);
-    const [selTable, setSelTable] = useState('');
-    const [schemaInfo, setSchemaInfo] = useState(null);
-    const [loadingDbs, setLoadingDbs] = useState(false);
-    const [loadingTables, setLoadingTables] = useState(false);
-    const [loadingSchema, setLoadingSchema] = useState(false);
-
-    // Step 2 — config
-    const [dashboardTitle, setDashboardTitle] = useState('');
-    const [requirements, setRequirements] = useState('');
-    const [datasetName, setDatasetName] = useState('');
-    const [supersetUrl, setSupersetUrl] = useState(() => localStorage.getItem('dw_superset_url') || '');
-    const [supersetUser, setSupersetUser] = useState(() => localStorage.getItem('dw_superset_user') || 'admin');
-    const [supersetPass, setSupersetPass] = useState('');
-    const [supersetDatasets, setSupersetDatasets] = useState([]);
-    const [testingSuperset, setTestingSuperset] = useState(false);
-    const [supersetStatus, setSupersetStatus] = useState(null);
-    const [supersetError, setSupersetError] = useState('');
-    const [loadingDatasets, setLoadingDatasets] = useState(false);
-    const [existingDashboardId, setExistingDashboardId] = useState('');
-
-    // Step 3 — plan
-    const planSSE = useSSE();
-    const [dashboardPlan, setDashboardPlan] = useState(null);
-    const [planDatasetInfo, setPlanDatasetInfo] = useState(null);
-
-    // Step 4 — build
-    const [buildLogs, setBuildLogs] = useState([]);
-    const [buildStreaming, setBuildStreaming] = useState(false);
-    const [buildError, setBuildError] = useState('');
-    const [buildResult, setBuildResult] = useState(null);
-
-    // User info
-    const user = (() => { try { return JSON.parse(localStorage.getItem('user') || '{}'); } catch { return {}; } })();
-
-    // Load connections
-    useEffect(() => {
-        api.post(`${API}/connections/fetch`)
-            .then(r => setConnections(r.data.filter(c => c.type !== 'airflow')))
-            .catch(() => {});
-    }, []);
-
-    useEffect(() => { if (supersetUrl) localStorage.setItem('dw_superset_url', supersetUrl); }, [supersetUrl]);
-    useEffect(() => { if (supersetUser) localStorage.setItem('dw_superset_user', supersetUser); }, [supersetUser]);
-
-    const handleLogout = async () => {
-        try { await fetch(`${API}/auth/logout`, { method: 'POST', credentials: 'include' }); } catch {}
-        localStorage.removeItem('user');
-        navigate('/login', { replace: true });
-    };
-
-    // ── Handlers ──────────────────────────────────────────────────────────────
-
-    const handleConnChange = async (connId) => {
-        const conn = connections.find(c => c.id.toString() === connId);
-        setSelConn(conn || null); setSelDb(''); setSelTable('');
-        setDatabases([]); setTables([]); setSchemaInfo(null);
-        if (!conn) return;
-        setLoadingDbs(true);
-        try { const r = await api.post(`${API}/explore/fetch`, { id: conn.id, type: 'databases' }); setDatabases(r.data); } catch { }
-        setLoadingDbs(false);
-    };
-
-    const handleDbChange = async (db) => {
-        setSelDb(db); setSelTable(''); setTables([]); setSchemaInfo(null);
-        if (!db || !selConn) return;
-        setLoadingTables(true);
-        try { const r = await api.post(`${API}/explore/fetch`, { id: selConn.id, type: 'tables', db }); setTables(r.data); } catch { }
-        setLoadingTables(false);
-    };
-
-    const handleTableChange = async (tName) => {
-        setSelTable(tName); setSchemaInfo(null);
-        if (!tName || !selConn || !selDb) return;
-        if (!datasetName) setDatasetName(tName);
-        setLoadingSchema(true);
-        try {
-            const r = await api.post(`${API}/datawizz/schema`, { connection_id: selConn.id, db_name: selDb, table_name: tName });
-            setSchemaInfo(r.data);
-        } catch (e) { setSchemaInfo({ error: e.response?.data?.error || e.message }); }
-        setLoadingSchema(false);
-    };
-
-    const testSuperset = async () => {
-        setTestingSuperset(true); setSupersetStatus(null); setSupersetError('');
-        try {
-            await api.post(`${API}/datawizz/superset/test`, { url: supersetUrl, username: supersetUser, password: supersetPass });
-            setSupersetStatus('ok');
-            setLoadingDatasets(true);
-            const r = await api.post(`${API}/datawizz/superset/datasets`, { url: supersetUrl, username: supersetUser, password: supersetPass });
-            setSupersetDatasets(r.data);
-            setLoadingDatasets(false);
-        } catch (e) { setSupersetStatus('error'); setSupersetError(e.response?.data?.error || e.message); }
-        setTestingSuperset(false);
-    };
-
-    const runPlan = () => {
-        setDashboardPlan(null); setPlanDatasetInfo(null); setStep(3);
-        const params = new URLSearchParams({
-            connection_id: selConn.id, db_name: selDb, table_name: selTable,
-            dashboard_title: dashboardTitle || selTable, requirements,
-        });
-        planSSE.start(`${API}/datawizz/plan?${params}`);
-    };
-
-    useEffect(() => {
-        if (planSSE.result) { setDashboardPlan(planSSE.result.plan); setPlanDatasetInfo(planSSE.result.datasetInfo); }
-    }, [planSSE.result]);
-
-    const handleBuild = async () => {
-        setBuildLogs([]); setBuildStreaming(true); setBuildError(''); setBuildResult(null); setStep(4);
-        const body = {
-            plan: dashboardPlan, datasetInfo: planDatasetInfo,
-            dataset_name: datasetName, superset_url: supersetUrl,
-            superset_username: supersetUser, superset_password: supersetPass,
-            dashboard_id: existingDashboardId ? parseInt(existingDashboardId) : undefined,
-        };
-        try {
-            const resp = await fetch(`${API}/datawizz/build`, {
-                method: 'POST',
-                credentials: 'include',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(body),
-            });
-            const reader = resp.body.getReader();
-            const decoder = new TextDecoder();
-            let buf = '';
-            while (true) {
-                const { value, done } = await reader.read();
-                if (done) break;
-                buf += decoder.decode(value, { stream: true });
-                const parts = buf.split('\n\n');
-                buf = parts.pop();
-                for (const part of parts) {
-                    const line = part.replace(/^data: /, '').trim();
-                    if (!line) continue;
-                    try {
-                        const ev = JSON.parse(line);
-                        if (ev.type === 'progress') setBuildLogs(p => [...p, ev]);
-                        else if (ev.type === 'done') { setBuildResult(ev); setBuildStreaming(false); }
-                        else if (ev.type === 'error') { setBuildError(ev.message); setBuildStreaming(false); }
-                    } catch { }
-                }
-            }
-            setBuildStreaming(false);
-        } catch (e) { setBuildError(e.message); setBuildStreaming(false); }
-    };
-
-    // ── Derived state ─────────────────────────────────────────────────────────
-    const canStep2 = selConn && selDb && selTable && schemaInfo && !schemaInfo?.error;
-    const canStep3 = canStep2 && requirements.trim() && datasetName.trim() && supersetUrl && supersetUser && supersetPass;
-    const canBuild = dashboardPlan && !buildStreaming;
-
-    const STEPS = [
-        { n: 1, label: 'Data Source',   done: step > 1 },
-        { n: 2, label: 'Configure',     done: step > 2 },
-        { n: 3, label: 'Generate Plan', done: step > 3 },
-        { n: 4, label: 'Build',         done: !!buildResult },
-    ];
-
-    // ── Layout ────────────────────────────────────────────────────────────────
-    return (
-        <div className="flex h-screen bg-[#f8fafc] font-sans overflow-hidden">
-
-            {/* ── Sidebar ── */}
-            <aside className="w-64 bg-gray-50 border-r border-gray-200 flex flex-col shrink-0">
-                {/* Logo */}
-                <div className="px-6 py-5 border-b border-gray-200">
-                    <div className="flex items-center gap-3">
-                        <div className="w-9 h-9 bg-gradient-to-br from-emerald-500 to-teal-600 rounded-xl flex items-center justify-center shadow-lg shadow-emerald-200">
-                            <i className="fas fa-chart-pie text-white text-sm"></i>
-                        </div>
-                        <div>
-                            <p className="font-extrabold text-gray-800 text-base leading-tight">Data Wizz</p>
-                            <p className="text-[10px] text-gray-500 font-medium">AI Dashboard Builder</p>
-                        </div>
-                    </div>
-                </div>
-
-                {/* Back link */}
-                <div className="px-4 pt-4">
-                    <button
-                        onClick={() => navigate('/')}
-                        className="w-full flex items-center gap-2 px-3 py-2 rounded-lg text-sm text-gray-500 hover:bg-white hover:text-gray-800 transition-all font-medium"
-                    >
-                        <i className="fas fa-arrow-left text-xs w-5 text-center"></i>
-                        All Tools
-                    </button>
-                </div>
-
-                {/* Steps nav */}
-                <div className="px-4 pt-4 flex-1 overflow-y-auto">
-                    <p className="text-[10px] font-bold text-gray-400 uppercase tracking-widest px-3 mb-2">Steps</p>
-                    <div className="space-y-1">
-                        {STEPS.map(s => (
-                            <StepPill
-                                key={s.n}
-                                n={s.n}
-                                label={s.label}
-                                active={step === s.n}
-                                done={s.done}
-                                onClick={() => { if (s.done || step === s.n) setStep(s.n); }}
-                            />
-                        ))}
-                    </div>
-                </div>
-
-                {/* User + logout */}
-                <div className="px-4 pb-4 border-t border-gray-200 pt-4 mt-2">
-                    <div className="bg-white rounded-xl border border-gray-200 p-3 flex items-center gap-3">
-                        <div className="w-8 h-8 rounded-lg bg-gradient-to-br from-emerald-400 to-teal-500 flex items-center justify-center shrink-0">
-                            <span className="text-white text-xs font-bold uppercase">
-                                {(user.username || user.name || 'U').charAt(0)}
-                            </span>
-                        </div>
-                        <div className="flex-1 min-w-0">
-                            <p className="text-xs font-bold text-gray-800 truncate">{user.username || user.name || 'User'}</p>
-                            <p className="text-[10px] text-gray-400 truncate">{user.email || 'Logged in'}</p>
-                        </div>
-                        <button
-                            onClick={handleLogout}
-                            title="Sign out"
-                            className="w-7 h-7 flex items-center justify-center rounded-lg text-gray-400 hover:bg-red-50 hover:text-red-500 transition-all"
-                        >
-                            <i className="fas fa-sign-out-alt text-xs"></i>
-                        </button>
-                    </div>
-                </div>
-            </aside>
-
-            {/* ── Main area ── */}
-            <div className="flex-1 flex flex-col overflow-hidden">
-
-                {/* Header */}
-                <header className="bg-white border-b border-gray-200 px-8 py-4 flex items-center justify-between shrink-0">
-                    <div>
-                        <h1 className="text-lg font-extrabold text-gray-800">
-                            {['', 'Select Data Source', 'Configure Dashboard', 'AI Dashboard Plan', 'Build Dashboard'][step]}
-                        </h1>
-                        {selTable && (
-                            <p className="text-xs text-gray-500 mt-0.5 font-mono">
-                                <i className="fas fa-database mr-1.5 text-emerald-500"></i>
-                                {selDb}.{selTable}
-                            </p>
-                        )}
-                    </div>
-                    <div className="flex items-center gap-2">
-                        {STEPS.map(s => (
-                            <div
-                                key={s.n}
-                                className={`w-2 h-2 rounded-full transition-all ${step === s.n ? 'bg-emerald-500 w-4' : s.done ? 'bg-emerald-300' : 'bg-gray-200'}`}
-                            />
-                        ))}
-                    </div>
-                </header>
-
-                {/* Content */}
-                <main className="flex-1 overflow-y-auto px-8 py-8 bg-[#f4f7fa]">
-                    <div className="max-w-3xl mx-auto space-y-6">
-
-                        {/* ════════════════ STEP 1 ════════════════ */}
-                        {step === 1 && (
-                            <div className="space-y-6">
-                                <div className="bg-white rounded-2xl shadow-sm border border-gray-200 p-6 space-y-5">
-                                    <div>
-                                        <h2 className="text-base font-bold text-gray-800 mb-1">Choose Connection</h2>
-                                        <p className="text-sm text-gray-500">Pick the table you want to build a dashboard for.</p>
-                                    </div>
-                                    <div className="grid grid-cols-3 gap-4">
-                                        <Field label="Connection">
-                                            <div className="relative">
-                                                <select value={selConn?.id || ''} onChange={e => handleConnChange(e.target.value)} className={SELECT}>
-                                                    <option value="" className="bg-white text-gray-800">— pick one —</option>
-                                                    {connections.map(c => <option key={c.id} value={c.id} className="bg-white text-gray-800">{c.name}</option>)}
-                                                </select>
-                                                <i className="fas fa-chevron-down absolute right-3 top-3.5 text-gray-400 text-xs pointer-events-none"></i>
-                                            </div>
-                                        </Field>
-                                        <Field label="Database">
-                                            <div className="relative">
-                                                <select value={selDb} onChange={e => handleDbChange(e.target.value)} disabled={!selConn || loadingDbs} className={SELECT}>
-                                                    <option value="" className="bg-white text-gray-800">— pick one —</option>
-                                                    {databases.map(db => <option key={db} value={db} className="bg-white text-gray-800">{db}</option>)}
-                                                </select>
-                                                <i className="fas fa-chevron-down absolute right-3 top-3.5 text-gray-400 text-xs pointer-events-none"></i>
-                                            </div>
-                                            {loadingDbs && <p className="text-[10px] text-emerald-500 mt-1"><i className="fas fa-spinner fa-spin mr-1"></i>Loading…</p>}
-                                        </Field>
-                                        <Field label="Table">
-                                            <div className="relative">
-                                                <select value={selTable} onChange={e => handleTableChange(e.target.value)} disabled={!selDb || loadingTables} className={SELECT}>
-                                                    <option value="" className="bg-white text-gray-800">— pick one —</option>
-                                                    {tables.map(t => <option key={t} value={t} className="bg-white text-gray-800">{t}</option>)}
-                                                </select>
-                                                <i className="fas fa-chevron-down absolute right-3 top-3.5 text-gray-400 text-xs pointer-events-none"></i>
-                                            </div>
-                                            {loadingTables && <p className="text-[10px] text-emerald-500 mt-1"><i className="fas fa-spinner fa-spin mr-1"></i>Loading…</p>}
-                                        </Field>
-                                    </div>
-
-                                    {/* Schema preview */}
-                                    {loadingSchema && (
-                                        <div className="flex items-center gap-2 text-emerald-600 text-sm">
-                                            <span className="w-2 h-2 bg-emerald-500 rounded-full animate-pulse"></span>
-                                            Fetching schema and metadata…
-                                        </div>
-                                    )}
-
-                                    {schemaInfo && !schemaInfo.error && (
-                                        <div>
-                                            <div className="flex items-center justify-between mb-3">
-                                                <p className="text-sm font-bold text-gray-600">
-                                                    <i className="fas fa-table mr-2 text-emerald-500"></i>
-                                                    {schemaInfo.columns?.length} columns detected
-                                                </p>
-                                                {schemaInfo.description && (
-                                                    <span className="text-[10px] bg-amber-50 text-amber-600 border border-amber-200 px-2 py-0.5 rounded-full font-bold">
-                                                        <i className="fas fa-book-open mr-1"></i>metadata enriched
-                                                    </span>
-                                                )}
-                                            </div>
-                                            {schemaInfo.description && (
-                                                <div className="mb-3 bg-amber-50 border border-amber-200 rounded-xl p-3 text-xs text-amber-700">
-                                                    {schemaInfo.description}
-                                                </div>
-                                            )}
-                                            <div className="rounded-xl border border-gray-200 overflow-hidden">
-                                                <div className="overflow-y-auto max-h-52">
-                                                    <table className="min-w-full">
-                                                        <thead className="bg-gray-50 sticky top-0">
-                                                            <tr>
-                                                                <th className="px-4 py-2.5 text-left text-[10px] font-bold text-gray-500 uppercase tracking-wider">Column</th>
-                                                                <th className="px-4 py-2.5 text-left text-[10px] font-bold text-gray-500 uppercase tracking-wider">Type</th>
-                                                                <th className="px-4 py-2.5 text-left text-[10px] font-bold text-gray-500 uppercase tracking-wider">Description</th>
-                                                            </tr>
-                                                        </thead>
-                                                        <tbody className="bg-white">
-                                                            {schemaInfo.columns?.map((col, i) => {
-                                                                const badge = {
-                                                                    NUMERIC:  'bg-emerald-50 text-emerald-700 border-emerald-200',
-                                                                    DATETIME: 'bg-violet-50 text-violet-700 border-violet-200',
-                                                                    STRING:   'bg-sky-50 text-sky-700 border-sky-200',
-                                                                }[col.type] || 'bg-gray-50 text-gray-500 border-gray-200';
-                                                                return (
-                                                                    <tr key={i} className="border-t border-gray-100 hover:bg-gray-50 transition-colors">
-                                                                        <td className="px-4 py-2 font-mono text-xs text-gray-700">{col.column_name}</td>
-                                                                        <td className="px-4 py-2">
-                                                                            <span className={`text-[9px] font-bold px-2 py-0.5 rounded-full border ${badge}`}>{col.type}</span>
-                                                                        </td>
-                                                                        <td className="px-4 py-2 text-[11px] text-gray-400 italic">{safeStr(col.comment) || '—'}</td>
-                                                                    </tr>
-                                                                );
-                                                            })}
-                                                        </tbody>
-                                                    </table>
-                                                </div>
-                                            </div>
-                                        </div>
-                                    )}
-
-                                    {schemaInfo?.error && (
-                                        <div className="bg-red-50 border border-red-200 rounded-xl p-3 text-red-600 text-sm flex items-center gap-2">
-                                            <i className="fas fa-exclamation-circle shrink-0"></i> {schemaInfo.error}
-                                        </div>
-                                    )}
-                                </div>
-
-                                <div className="flex justify-end">
-                                    <button
-                                        onClick={() => setStep(2)}
-                                        disabled={!canStep2}
-                                        className="bg-emerald-600 hover:bg-emerald-700 disabled:bg-gray-200 disabled:text-gray-400 disabled:cursor-not-allowed text-white font-bold px-8 py-3 rounded-xl flex items-center gap-2 transition-all shadow-sm"
-                                    >
-                                        Continue <i className="fas fa-arrow-right text-sm"></i>
-                                    </button>
-                                </div>
-                            </div>
-                        )}
-
-                        {/* ════════════════ STEP 2 ════════════════ */}
-                        {step === 2 && (
-                            <div className="space-y-6">
-                                <div className="bg-white rounded-2xl shadow-sm border border-gray-200 p-6 space-y-5">
-                                    <h3 className="text-sm font-bold text-gray-700 border-b border-gray-100 pb-3">Dashboard Settings</h3>
-                                    <div className="grid grid-cols-2 gap-4">
-                                        <Field label="Dashboard Title">
-                                            <input type="text" value={dashboardTitle} onChange={e => setDashboardTitle(e.target.value)} placeholder={`${selTable || 'My'} Dashboard`} className={INPUT} />
-                                        </Field>
-                                        <Field label="Superset Dataset Name" hint="(existing dataset in Superset)">
-                                            <input type="text" value={datasetName} onChange={e => setDatasetName(e.target.value)} placeholder={selTable} list="dw-datasets" className={INPUT} />
-                                            <datalist id="dw-datasets">{supersetDatasets.map(d => <option key={d.id} value={d.name} />)}</datalist>
-                                        </Field>
-                                    </div>
-                                    <Field label="Requirements" hint="(describe what charts you need)">
-                                        <textarea
-                                            value={requirements}
-                                            onChange={e => setRequirements(e.target.value)}
-                                            rows={5}
-                                            placeholder={"- Total revenue KPI\n- Monthly trend by region\n- Top 10 products (bar)\n- Revenue by category (pie)\n- Filter by date range"}
-                                            className={`${INPUT} resize-none`}
-                                        />
-                                    </Field>
-                                    <Field label="Update Existing Dashboard" hint="(leave blank to create new)">
-                                        <input type="number" value={existingDashboardId} onChange={e => setExistingDashboardId(e.target.value)} placeholder="Dashboard ID (optional)" className={`${INPUT} w-56`} />
-                                    </Field>
-                                </div>
-
-                                <div className="bg-white rounded-2xl shadow-sm border border-gray-200 p-6 space-y-5">
-                                    <h3 className="text-sm font-bold text-gray-700 border-b border-gray-100 pb-3">Superset Connection</h3>
-                                    <div className="grid grid-cols-3 gap-4">
-                                        <Field label="URL">
-                                            <input type="text" value={supersetUrl} onChange={e => setSupersetUrl(e.target.value)} placeholder="http://localhost:8088" className={INPUT} />
-                                        </Field>
-                                        <Field label="Username">
-                                            <input type="text" value={supersetUser} onChange={e => setSupersetUser(e.target.value)} placeholder="admin" className={INPUT} />
-                                        </Field>
-                                        <Field label="Password">
-                                            <input type="password" value={supersetPass} onChange={e => setSupersetPass(e.target.value)} placeholder="••••••••" className={INPUT} />
-                                        </Field>
-                                    </div>
-                                    <div className="flex items-center gap-4">
-                                        <button
-                                            onClick={testSuperset}
-                                            disabled={testingSuperset || !supersetUrl || !supersetUser || !supersetPass}
-                                            className="bg-indigo-50 hover:bg-indigo-100 disabled:opacity-40 disabled:cursor-not-allowed border border-indigo-200 text-indigo-700 font-bold text-sm px-5 py-2 rounded-xl flex items-center gap-2 transition-all"
-                                        >
-                                            {testingSuperset
-                                                ? <><i className="fas fa-spinner fa-spin"></i> Testing…</>
-                                                : <><i className="fas fa-plug"></i> Test Connection</>}
-                                        </button>
-                                        {supersetStatus === 'ok' && (
-                                            <span className="text-emerald-600 text-sm font-bold flex items-center gap-1.5">
-                                                <i className="fas fa-check-circle"></i> Connected · {supersetDatasets.length} datasets
-                                            </span>
-                                        )}
-                                        {supersetStatus === 'error' && (
-                                            <span className="text-red-500 text-sm flex items-center gap-1.5">
-                                                <i className="fas fa-times-circle"></i> {supersetError}
-                                            </span>
-                                        )}
-                                        {loadingDatasets && <span className="text-gray-400 text-xs"><i className="fas fa-spinner fa-spin mr-1"></i>Loading datasets…</span>}
-                                    </div>
-                                </div>
-
-                                <div className="flex justify-between">
-                                    <button onClick={() => setStep(1)} className="text-gray-500 hover:text-gray-800 border border-gray-200 hover:border-gray-300 bg-white font-bold px-6 py-2.5 rounded-xl flex items-center gap-2 transition-all text-sm">
-                                        <i className="fas fa-arrow-left text-xs"></i> Back
-                                    </button>
-                                    <button
-                                        onClick={runPlan}
-                                        disabled={!canStep3}
-                                        className="bg-emerald-600 hover:bg-emerald-700 disabled:bg-gray-200 disabled:text-gray-400 disabled:cursor-not-allowed text-white font-bold px-8 py-3 rounded-xl flex items-center gap-2 transition-all shadow-sm"
-                                    >
-                                        <i className="fas fa-brain"></i> Generate Plan
-                                    </button>
-                                </div>
-                            </div>
-                        )}
-
-                        {/* ════════════════ STEP 3 ════════════════ */}
-                        {step === 3 && (
-                            <div className="space-y-6">
-                                <div className="bg-white rounded-2xl shadow-sm border border-gray-200 p-6 space-y-5">
-                                    <div>
-                                        <h2 className="text-base font-bold text-gray-800 mb-1">AI Dashboard Plan</h2>
-                                        <p className="text-sm text-gray-500">Two agents are analyzing your requirements and designing the optimal charts.</p>
-                                    </div>
-                                    <Terminal logs={planSSE.logs} streaming={planSSE.isStreaming} error={planSSE.error} emptyText="Agents starting…" />
-                                </div>
-
-                                {dashboardPlan && (
-                                    <div className="space-y-4">
-                                        <div className="bg-emerald-50 border border-emerald-200 rounded-2xl p-5 flex items-start gap-4">
-                                            <div className="w-10 h-10 bg-emerald-600 rounded-xl flex items-center justify-center shrink-0 shadow-sm">
-                                                <i className="fas fa-check text-white text-sm"></i>
-                                            </div>
-                                            <div>
-                                                <p className="font-extrabold text-gray-800 text-base">{dashboardPlan.dashboard_title}</p>
-                                                <p className="text-gray-500 text-sm mt-0.5">{dashboardPlan.reasoning}</p>
-                                            </div>
-                                        </div>
-
-                                        <div className="bg-white rounded-2xl shadow-sm border border-gray-200 p-5">
-                                            <p className="text-sm font-bold text-gray-500 uppercase tracking-widest mb-3">
-                                                {dashboardPlan.charts?.length} charts planned
-                                            </p>
-                                            <div className="grid grid-cols-2 gap-3">
-                                                {dashboardPlan.charts?.map((chart, i) => <ChartCard key={i} chart={chart} />)}
-                                            </div>
-                                        </div>
-
-                                        {dashboardPlan.filters?.length > 0 && (
-                                            <div className="bg-white rounded-2xl shadow-sm border border-gray-200 p-5">
-                                                <p className="text-sm font-bold text-gray-500 uppercase tracking-widest mb-3">{dashboardPlan.filters.length} filters</p>
-                                                <div className="flex flex-wrap gap-2">
-                                                    {dashboardPlan.filters.map((f, i) => (
-                                                        <span key={i} className="bg-indigo-50 border border-indigo-200 text-indigo-700 text-xs font-bold px-3 py-1.5 rounded-xl">
-                                                            <i className="fas fa-filter mr-1.5 text-[9px]"></i>{safeStr(f.label)} · {safeStr(f.filter_type)}
-                                                        </span>
-                                                    ))}
-                                                </div>
-                                            </div>
-                                        )}
-                                    </div>
-                                )}
-
-                                <div className="flex justify-between">
-                                    <button onClick={() => setStep(2)} className="text-gray-500 hover:text-gray-800 border border-gray-200 hover:border-gray-300 bg-white font-bold px-6 py-2.5 rounded-xl flex items-center gap-2 transition-all text-sm">
-                                        <i className="fas fa-arrow-left text-xs"></i> Back
-                                    </button>
-                                    <div className="flex gap-3">
-                                        <button onClick={runPlan} disabled={planSSE.isStreaming} className="text-gray-500 hover:text-gray-800 border border-gray-200 hover:border-gray-300 bg-white font-bold px-5 py-2.5 rounded-xl flex items-center gap-2 transition-all text-sm disabled:opacity-30">
-                                            <i className="fas fa-redo text-xs"></i> Re-run
-                                        </button>
-                                        <button
-                                            onClick={handleBuild}
-                                            disabled={!canBuild}
-                                            className="bg-emerald-600 hover:bg-emerald-700 disabled:bg-gray-200 disabled:text-gray-400 disabled:cursor-not-allowed text-white font-bold px-8 py-3 rounded-xl flex items-center gap-2 transition-all shadow-sm"
-                                        >
-                                            <i className="fas fa-rocket"></i> Build Dashboard
-                                        </button>
-                                    </div>
-                                </div>
-                            </div>
-                        )}
-
-                        {/* ════════════════ STEP 4 ════════════════ */}
-                        {step === 4 && (
-                            <div className="space-y-6">
-                                <div className="bg-white rounded-2xl shadow-sm border border-gray-200 p-6 space-y-5">
-                                    <div>
-                                        <h2 className="text-base font-bold text-gray-800 mb-1">Building Dashboard</h2>
-                                        <p className="text-sm text-gray-500">Creating charts and assembling your Superset dashboard.</p>
-                                    </div>
-                                    <Terminal logs={buildLogs} streaming={buildStreaming} error={buildError} emptyText="Build starting…" />
-                                </div>
-
-                                {buildResult && (
-                                    <div className="space-y-4">
-                                        {/* Success banner */}
-                                        <div className="bg-emerald-50 border border-emerald-200 rounded-2xl p-6 flex items-start gap-4">
-                                            <div className="w-12 h-12 bg-emerald-600 rounded-2xl flex items-center justify-center shrink-0 shadow-sm">
-                                                <i className="fas fa-check text-white text-lg"></i>
-                                            </div>
-                                            <div className="flex-1">
-                                                <p className="font-extrabold text-gray-800 text-lg">Dashboard Created!</p>
-                                                <p className="text-emerald-600 text-sm mt-0.5">ID: {buildResult.dashboard?.id}</p>
-                                                <a
-                                                    href={buildResult.dashboard?.url}
-                                                    target="_blank"
-                                                    rel="noreferrer"
-                                                    className="inline-flex items-center gap-2 mt-4 bg-emerald-600 hover:bg-emerald-700 text-white font-bold text-sm px-5 py-2.5 rounded-xl transition-all shadow-sm"
-                                                >
-                                                    <i className="fas fa-external-link-alt text-xs"></i> Open in Superset
-                                                </a>
-                                            </div>
-                                        </div>
-
-                                        {/* Charts built */}
-                                        {buildResult.chartActions?.length > 0 && (
-                                            <div className="bg-white rounded-2xl shadow-sm border border-gray-200 p-5">
-                                                <p className="text-sm font-bold text-gray-500 uppercase tracking-widest mb-4">Charts built ({buildResult.chartActions.length})</p>
-                                                <div className="space-y-2">
-                                                    {buildResult.chartActions.map(([id, action], i) => (
-                                                        <div key={i} className="flex items-center gap-3 text-xs">
-                                                            <span className={`font-bold px-2 py-0.5 rounded-lg ${action === 'created' ? 'bg-emerald-50 text-emerald-700 border border-emerald-200' : 'bg-sky-50 text-sky-700 border border-sky-200'}`}>
-                                                                {action}
-                                                            </span>
-                                                            <span className="font-mono text-gray-400">#{id}</span>
-                                                            {dashboardPlan?.charts?.[i] && <span className="text-gray-600 font-medium">{safeStr(dashboardPlan.charts[i].title)}</span>}
-                                                        </div>
-                                                    ))}
-                                                </div>
-                                            </div>
-                                        )}
-
-                                        {/* QA report */}
-                                        {buildResult.qaReport && (
-                                            <div className={`border rounded-2xl p-5 ${buildResult.qaReport.passed ? 'bg-emerald-50 border-emerald-200' : 'bg-amber-50 border-amber-200'}`}>
-                                                <p className={`text-sm font-bold uppercase tracking-widest mb-3 flex items-center gap-2 ${buildResult.qaReport.passed ? 'text-emerald-700' : 'text-amber-700'}`}>
-                                                    <i className={`fas ${buildResult.qaReport.passed ? 'fa-shield-check' : 'fa-exclamation-triangle'} text-xs`}></i>
-                                                    QA Review {buildResult.qaReport.passed ? 'Passed' : `— ${buildResult.qaReport.issues.length} issue(s)`}
-                                                </p>
-                                                {buildResult.qaReport.issues.map((issue, i) => (
-                                                    <p key={i} className="text-xs text-amber-700 flex items-start gap-1.5 mb-1.5">
-                                                        <i className="fas fa-times-circle mt-0.5 shrink-0"></i>{fmtQA(issue)}
-                                                    </p>
-                                                ))}
-                                                {buildResult.qaReport.suggestions.map((s, i) => (
-                                                    <p key={i} className="text-xs text-gray-500 flex items-start gap-1.5 mb-1.5">
-                                                        <i className="fas fa-lightbulb text-amber-500 mt-0.5 shrink-0"></i>{fmtQA(s)}
-                                                    </p>
-                                                ))}
-                                            </div>
-                                        )}
-                                    </div>
-                                )}
-
-                                <div className="flex justify-between">
-                                    <button onClick={() => setStep(3)} className="text-gray-500 hover:text-gray-800 border border-gray-200 hover:border-gray-300 bg-white font-bold px-6 py-2.5 rounded-xl flex items-center gap-2 transition-all text-sm">
-                                        <i className="fas fa-arrow-left text-xs"></i> Back to Plan
-                                    </button>
-                                    <button
-                                        onClick={() => { setStep(1); setDashboardPlan(null); setBuildResult(null); setBuildLogs([]); setSchemaInfo(null); setSelTable(''); setSelDb(''); setSelConn(null); }}
-                                        className="text-gray-500 hover:text-gray-800 border border-gray-200 hover:border-gray-300 bg-white font-bold px-6 py-2.5 rounded-xl flex items-center gap-2 transition-all text-sm"
-                                    >
-                                        <i className="fas fa-plus text-xs"></i> New Dashboard
-                                    </button>
-                                </div>
-                            </div>
-                        )}
-
-                    </div>
-                </main>
-            </div>
-        </div>
-    );
-}
-
+ENDOFFILE
 
 cat << 'EOF' > "$APP_DIR/frontend/src/main.jsx"
 import React from 'react'
@@ -8691,6 +8472,369 @@ export default function AdminUsers() {
 }
 EOF
 
+cat << 'EOF' > "$APP_DIR/frontend/src/pages/Lineage.jsx"
+import React, { useState, useEffect, useCallback } from 'react';
+import api, { API } from '../utils/api';
+
+const APP_COLORS = [
+    '#4f46e5','#10b981','#f59e0b','#ef4444','#8b5cf6',
+    '#06b6d4','#f97316','#84cc16','#ec4899','#14b8a6',
+    '#a855f7','#eab308','#6366f1','#22c55e','#fb923c',
+    '#0891b2','#dc2626','#059669','#7c3aed','#db2777',
+];
+
+const LAYER_ORDER = ['raw_hudi', 'curated', 'service', 'bi'];
+const LAYER_LABELS = { raw_hudi: 'Raw (Hudi)', curated: 'Curated', service: 'Service', bi: 'BI / Reports' };
+
+const SourceBadge = ({ source }) => (
+    <span className={`text-[9px] font-bold px-1.5 py-0.5 rounded uppercase tracking-wider ${source === 'hive' ? 'bg-orange-100 text-orange-700' : 'bg-cyan-100 text-cyan-700'}`}>
+        {source === 'hive' ? 'Hive' : 'SR'}
+    </span>
+);
+
+export default function Lineage() {
+    const [conns, setConns] = useState([]);
+    const [hiveConn, setHiveConn] = useState('');
+    const [srConn, setSrConn] = useState('');
+    const [apps, setApps] = useState([]);
+    const [appColors, setAppColors] = useState({});
+    const [selApp, setSelApp] = useState('');
+    const [allNodes, setAllNodes] = useState([]);
+    const [allEdges, setAllEdges] = useState([]);
+    const [loading, setLoading] = useState(false);
+    const [error, setError] = useState('');
+    const [msg, setMsg] = useState('');
+    const [view, setView] = useState('table');
+    const [selNode, setSelNode] = useState(null);
+    const [expandedLayers, setExpandedLayers] = useState({});
+    const [nodeColumns, setNodeColumns] = useState({});
+    const [loadingCols, setLoadingCols] = useState(false);
+    const [selColumn, setSelColumn] = useState(null);
+
+    useEffect(() => {
+        api.post(`${API}/connections/fetch`, {}).then(r => {
+            setConns(r.data);
+            const hive = r.data.find(c => c.type === 'hive');
+            const sr = r.data.find(c => c.type === 'starrocks');
+            if (hive) setHiveConn(String(hive.id));
+            if (sr) setSrConn(String(sr.id));
+        }).catch(() => {});
+    }, []);
+
+    const loadLineage = async () => {
+        if (!hiveConn && !srConn) return setError('Select at least one connection');
+        setLoading(true); setError(''); setMsg('');
+        setSelApp(''); setSelNode(null); setSelColumn(null);
+        setNodeColumns({}); setExpandedLayers({});
+        try {
+            const res = await api.post(`${API}/lineage/real-lineage`, {
+                hive_connection_id: hiveConn ? Number(hiveConn) : null,
+                sr_connection_id: srConn ? Number(srConn) : null,
+            });
+            const nodes = res.data.nodes || [];
+            const edges = res.data.edges || [];
+            setAllNodes(nodes); setAllEdges(edges);
+            const uniqueApps = [...new Set(nodes.map(n => n.application))].sort();
+            const colors = {};
+            uniqueApps.forEach((a, i) => { colors[a] = APP_COLORS[i % APP_COLORS.length]; });
+            setApps(uniqueApps); setAppColors(colors);
+            setMsg(`${nodes.length} nodes · ${edges.length} edges · ${uniqueApps.length} applications`);
+        } catch (e) { setError(e.response?.data?.error || 'Failed to load lineage'); }
+        setLoading(false);
+    };
+
+    const loadAllColumns = useCallback(async (app, nodes) => {
+        const appNodes = nodes.filter(n => n.application === app);
+        setLoadingCols(true);
+        const results = {};
+        await Promise.all(appNodes.map(async (node) => {
+            const connId = node.source === 'starrocks' ? srConn : hiveConn;
+            if (!connId) return;
+            try {
+                const res = await api.post(`${API}/lineage/node/columns`, {
+                    connection_id: Number(connId), db_name: node.db_name, table_name: node.table_name, source: node.source,
+                });
+                results[node.node_id] = res.data;
+            } catch (e) { results[node.node_id] = []; }
+        }));
+        setNodeColumns(results); setLoadingCols(false);
+    }, [hiveConn, srConn]);
+
+    const selectApp = (app) => {
+        const newApp = app === selApp ? '' : app;
+        setSelApp(newApp); setSelNode(null); setSelColumn(null); setNodeColumns({});
+        const expanded = {};
+        LAYER_ORDER.forEach(l => { expanded[l] = true; });
+        setExpandedLayers(expanded);
+        if (newApp) loadAllColumns(newApp, allNodes);
+    };
+
+    const appColor = appColors[selApp] || '#4f46e5';
+    const appNodes = allNodes.filter(n => n.application === selApp);
+    const byLayer = {};
+    LAYER_ORDER.forEach(l => { byLayer[l] = []; });
+    appNodes.forEach(n => { if (!byLayer[n.layer]) byLayer[n.layer] = []; byLayer[n.layer].push(n); });
+    const activeLayers = LAYER_ORDER.filter(l => byLayer[l]?.length > 0);
+
+    const connectedNodeIds = new Set();
+    if (selNode) {
+        allEdges.forEach(e => {
+            if (e.source_node_id === selNode.node_id) connectedNodeIds.add(e.target_node_id);
+            if (e.target_node_id === selNode.node_id) connectedNodeIds.add(e.source_node_id);
+        });
+    }
+
+    const getConnType = (node) => {
+        if (!selNode) return null;
+        if (allEdges.some(e => e.source_node_id === selNode.node_id && e.target_node_id === node.node_id)) return 'downstream';
+        if (allEdges.some(e => e.target_node_id === selNode.node_id && e.source_node_id === node.node_id)) return 'upstream';
+        return null;
+    };
+
+    const colExistsInLayer = (layer, colName) => {
+        const layerNodes = byLayer[layer] || [];
+        return layerNodes.some(node => {
+            const cols = nodeColumns[node.node_id] || [];
+            return cols.some(c => (c.name || c.Field || '').toLowerCase() === colName.toLowerCase());
+        });
+    };
+
+    return (
+        <div className="flex flex-col h-full overflow-hidden">
+            <div className="px-6 pt-5 pb-4 border-b border-gray-200 bg-white shrink-0">
+                <div className="flex items-start justify-between gap-4">
+                    <div>
+                        <h1 className="text-xl font-extrabold text-gray-800 tracking-tight flex items-center gap-2">
+                            <i className="fas fa-project-diagram text-indigo-600 text-lg"></i>
+                            Data Lineage
+                        </h1>
+                        <p className="text-xs text-gray-500 mt-0.5">{msg || 'Trace data flow across Hive and StarRocks layers'}</p>
+                    </div>
+                    <div className="flex items-center gap-2 flex-wrap">
+                        <select value={hiveConn} onChange={e => setHiveConn(e.target.value)}
+                            className="text-xs border border-gray-300 rounded-lg px-3 py-2 bg-white focus:outline-none focus:ring-2 focus:ring-indigo-300 text-gray-700">
+                            <option value="">Hive connection</option>
+                            {conns.filter(c => c.type === 'hive').map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
+                        </select>
+                        <select value={srConn} onChange={e => setSrConn(e.target.value)}
+                            className="text-xs border border-gray-300 rounded-lg px-3 py-2 bg-white focus:outline-none focus:ring-2 focus:ring-indigo-300 text-gray-700">
+                            <option value="">StarRocks connection</option>
+                            {conns.filter(c => c.type === 'starrocks').map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
+                        </select>
+                        <button onClick={loadLineage} disabled={loading || (!hiveConn && !srConn)}
+                            className="flex items-center gap-1.5 px-4 py-2 bg-indigo-600 hover:bg-indigo-700 disabled:opacity-50 text-white text-xs font-bold rounded-lg transition-colors shadow-sm">
+                            {loading ? <><i className="fas fa-spinner fa-spin"></i> Loading...</> : <><i className="fas fa-sync-alt"></i> Load Lineage</>}
+                        </button>
+                    </div>
+                </div>
+                {error && (
+                    <div className="mt-3 flex items-center gap-2 px-3 py-2 bg-red-50 border border-red-200 rounded-lg text-xs text-red-700">
+                        <i className="fas fa-exclamation-circle text-red-400"></i> {error}
+                    </div>
+                )}
+                {apps.length > 0 && (
+                    <div className="flex flex-wrap gap-1.5 mt-3 items-center">
+                        <span className="text-[10px] text-gray-400 font-bold uppercase tracking-widest shrink-0">App:</span>
+                        {apps.map(app => (
+                            <button key={app} onClick={() => selectApp(app)}
+                                style={{ borderColor: appColors[app], background: selApp === app ? appColors[app] : appColors[app] + '18', color: selApp === app ? '#fff' : appColors[app] }}
+                                className="text-[10px] font-semibold px-2.5 py-1 rounded-full border transition-all">
+                                {app}
+                            </button>
+                        ))}
+                    </div>
+                )}
+                {selApp && (
+                    <div className="flex gap-0 mt-3 border-b-2 border-gray-100">
+                        {[{ id: 'table', label: 'Table Lineage', icon: 'fa-table' }, { id: 'column', label: 'Column Lineage', icon: 'fa-columns' }].map(tab => (
+                            <button key={tab.id} onClick={() => { setView(tab.id); setSelColumn(null); setSelNode(null); }}
+                                style={view === tab.id ? { color: appColor, borderBottomColor: appColor } : {}}
+                                className={`flex items-center gap-1.5 px-4 py-2 text-xs font-bold border-b-2 -mb-0.5 transition-colors ${view === tab.id ? 'border-current' : 'text-gray-400 border-transparent hover:text-gray-600'}`}>
+                                <i className={`fas ${tab.icon} text-[10px]`}></i> {tab.label}
+                            </button>
+                        ))}
+                    </div>
+                )}
+            </div>
+            <div className="flex-1 overflow-auto p-6 bg-[#f5f7fa]">
+                {loading && (
+                    <div className="flex flex-col items-center justify-center h-full gap-3 text-gray-400">
+                        <i className="fas fa-spinner fa-spin text-4xl text-indigo-400"></i>
+                        <p className="text-sm font-medium">Reading Hive and StarRocks metadata...</p>
+                        <p className="text-xs">This may take up to 60 seconds</p>
+                    </div>
+                )}
+                {!loading && !selApp && (
+                    <div className="flex flex-col items-center justify-center h-full gap-3 text-gray-400">
+                        <i className="fas fa-project-diagram text-5xl opacity-20"></i>
+                        <p className="text-sm font-semibold text-gray-500">
+                            {apps.length > 0 ? 'Select an application above to explore its lineage' : 'Load lineage to get started'}
+                        </p>
+                        {apps.length === 0 && !loading && (
+                            <p className="text-xs text-gray-400">Select Hive and/or StarRocks connections, then click Load Lineage</p>
+                        )}
+                    </div>
+                )}
+                {!loading && selApp && view === 'table' && (
+                    <>
+                        {selNode && (
+                            <div style={{ borderColor: appColor + '40', background: appColor + '0d' }}
+                                className="mb-3 flex items-center gap-2 px-3 py-2 rounded-lg border text-xs">
+                                <i className="fas fa-dot-circle" style={{ color: appColor }}></i>
+                                <span className="font-mono font-semibold" style={{ color: appColor }}>{selNode.table_name}</span>
+                                <span className="text-gray-500">· {connectedNodeIds.size} connected · <span className="text-blue-600 font-semibold">blue=upstream</span> · <span className="text-emerald-600 font-semibold">green=downstream</span></span>
+                                <button onClick={() => setSelNode(null)} className="ml-auto text-gray-400 hover:text-gray-600 font-bold text-base leading-none">×</button>
+                            </div>
+                        )}
+                        <div className="flex gap-0 items-start overflow-x-auto pb-2">
+                            {activeLayers.map((layer, li) => {
+                                const layerNodes = byLayer[layer];
+                                const isExpanded = expandedLayers[layer] !== false;
+                                const hasHighlight = selNode && layerNodes.some(n => n.node_id === selNode.node_id || connectedNodeIds.has(n.node_id));
+                                return (
+                                    <React.Fragment key={layer}>
+                                        <div className="shrink-0 w-56">
+                                            <div onClick={() => setExpandedLayers(prev => ({ ...prev, [layer]: !isExpanded }))}
+                                                style={{ background: hasHighlight ? appColor : appColor + 'cc' }}
+                                                className="rounded-t-xl px-3 py-2.5 flex items-center gap-2 cursor-pointer select-none">
+                                                <span className="text-white text-[10px] font-bold uppercase tracking-wider flex-1">{LAYER_LABELS[layer]}</span>
+                                                <span className="bg-white/30 text-white text-[10px] font-bold px-2 py-0.5 rounded-full">{layerNodes.length}</span>
+                                                <i className={`fas fa-chevron-down text-white text-[10px] transition-transform ${isExpanded ? '' : '-rotate-90'}`}></i>
+                                            </div>
+                                            <div style={{ borderColor: appColor + '40' }} className="bg-white border border-t-0 rounded-b-xl overflow-hidden">
+                                                {isExpanded ? layerNodes.map((node, ni) => {
+                                                    const selected = selNode?.node_id === node.node_id;
+                                                    const connType = getConnType(node);
+                                                    const dimmed = selNode && !selected && !connType;
+                                                    return (
+                                                        <div key={ni} onClick={() => setSelNode(selected ? null : node)}
+                                                            style={{
+                                                                background: selected ? appColor : connType === 'downstream' ? '#ecfdf5' : connType === 'upstream' ? '#eff6ff' : 'transparent',
+                                                                borderLeftColor: selected ? appColor : connType === 'downstream' ? '#10b981' : connType === 'upstream' ? '#3b82f6' : 'transparent',
+                                                                opacity: dimmed ? 0.3 : 1,
+                                                            }}
+                                                            className="px-3 py-2 border-b border-gray-50 border-l-[3px] cursor-pointer flex items-center gap-2 transition-all hover:bg-gray-50 last:border-b-0">
+                                                            <div style={{ background: selected ? '#fff' : connType === 'downstream' ? '#10b981' : connType === 'upstream' ? '#3b82f6' : appColor + '50' }}
+                                                                className="w-1.5 h-1.5 rounded-full shrink-0" />
+                                                            <div className="flex-1 min-w-0">
+                                                                <div style={{ color: selected ? '#fff' : '#1f2937' }} className="text-[10px] font-mono font-semibold truncate">{node.table_name}</div>
+                                                                {connType && <div style={{ color: connType === 'downstream' ? '#059669' : '#2563eb' }} className="text-[9px] font-bold mt-0.5">{connType === 'downstream' ? '↓ downstream' : '↑ upstream'}</div>}
+                                                            </div>
+                                                            <SourceBadge source={node.source} />
+                                                        </div>
+                                                    );
+                                                }) : <div className="px-3 py-3 text-xs text-gray-400">{layerNodes.length} tables — click to expand</div>}
+                                            </div>
+                                        </div>
+                                        {li < activeLayers.length - 1 && (
+                                            <div className="flex items-center shrink-0" style={{ paddingTop: 18 }}>
+                                                <div style={{ background: appColor + '50', width: 20, height: 2 }} />
+                                                <svg width="8" height="12" viewBox="0 0 8 12" fill={appColor + '80'}><path d="M0,0 L8,6 L0,12 Z" /></svg>
+                                            </div>
+                                        )}
+                                    </React.Fragment>
+                                );
+                            })}
+                        </div>
+                    </>
+                )}
+                {!loading && selApp && view === 'column' && (
+                    <>
+                        <div className="mb-4 flex items-center gap-3 flex-wrap">
+                            {loadingCols ? (
+                                <div className="flex items-center gap-2 text-xs text-gray-500">
+                                    <i className="fas fa-spinner fa-spin text-indigo-400"></i> Loading all columns...
+                                </div>
+                            ) : (
+                                <div className="text-xs text-gray-500">
+                                    {selColumn ? (
+                                        <>Tracing <span style={{ color: appColor, background: appColor + '18' }} className="font-mono font-bold px-2 py-0.5 rounded">{selColumn}</span> across all layers</>
+                                    ) : 'Click any column to trace it across all layers'}
+                                    {selColumn && <button onClick={() => setSelColumn(null)} className="ml-2 text-gray-400 hover:text-gray-600 text-sm font-bold">× clear</button>}
+                                </div>
+                            )}
+                            {selColumn && !loadingCols && (
+                                <div className="flex gap-1.5 flex-wrap ml-auto">
+                                    {activeLayers.map(layer => {
+                                        const exists = colExistsInLayer(layer, selColumn);
+                                        return (
+                                            <span key={layer} style={exists ? { background: appColor, borderColor: appColor, color: '#fff' } : {}}
+                                                className={`text-[10px] font-bold px-2.5 py-0.5 rounded-full border ${exists ? '' : 'bg-gray-100 border-gray-200 text-gray-400'}`}>
+                                                {exists ? '✓' : '✗'} {LAYER_LABELS[layer]}
+                                            </span>
+                                        );
+                                    })}
+                                </div>
+                            )}
+                        </div>
+                        <div className="flex gap-0 items-start overflow-x-auto pb-2">
+                            {activeLayers.map((layer, li) => {
+                                const layerNodes = byLayer[layer];
+                                return (
+                                    <React.Fragment key={layer}>
+                                        <div className="shrink-0 w-60">
+                                            <div style={{ background: appColor }} className="rounded-t-xl px-3 py-2.5 flex items-center gap-2">
+                                                <span className="text-white text-[10px] font-bold uppercase tracking-wider flex-1">{LAYER_LABELS[layer]}</span>
+                                                <span className="bg-white/30 text-white text-[10px] font-bold px-2 py-0.5 rounded-full">{layerNodes.length}</span>
+                                            </div>
+                                            <div style={{ borderColor: appColor + '40' }} className="bg-white border border-t-0 rounded-b-xl overflow-hidden">
+                                                {loadingCols ? (
+                                                    <div className="p-4 text-center text-xs text-gray-400">
+                                                        <i className="fas fa-spinner fa-spin text-indigo-400 block mx-auto mb-1"></i> Loading columns...
+                                                    </div>
+                                                ) : layerNodes.map((node, ni) => {
+                                                    const cols = nodeColumns[node.node_id] || [];
+                                                    const hasMatch = selColumn && cols.some(c => (c.name || c.Field || '').toLowerCase() === selColumn.toLowerCase());
+                                                    return (
+                                                        <div key={ni}>
+                                                            <div style={{ background: hasMatch ? appColor + '12' : '#fafbfc', borderLeftColor: hasMatch ? appColor : 'transparent' }}
+                                                                className="px-3 py-1.5 border-b border-gray-100 border-l-[3px] flex items-center gap-1.5">
+                                                                <div style={{ background: hasMatch ? appColor : appColor + '40' }} className="w-1.5 h-1.5 rounded-full shrink-0" />
+                                                                <span style={{ color: hasMatch ? appColor : '#374151' }} className="text-[10px] font-mono font-semibold truncate flex-1">{node.table_name}</span>
+                                                                <span className="text-[9px] text-gray-400 shrink-0">{cols.length}</span>
+                                                                <SourceBadge source={node.source} />
+                                                            </div>
+                                                            {cols.length === 0 ? (
+                                                                <div className="px-4 py-1.5 text-[10px] text-gray-300 italic">No schema data</div>
+                                                            ) : cols.map((col, ci) => {
+                                                                const colName = col.name || col.Field || '';
+                                                                const colType = (col.type || col.Type || '').split('(')[0].substring(0, 12);
+                                                                const isMatch = selColumn && colName.toLowerCase() === selColumn.toLowerCase();
+                                                                return (
+                                                                    <div key={ci} onClick={() => setSelColumn(isMatch ? null : colName)}
+                                                                        className="flex items-center gap-1.5 px-4 py-1 border-b border-gray-50 cursor-pointer transition-colors last:border-b-0"
+                                                                        style={{ background: isMatch ? '#fef9c3' : 'transparent', borderLeftColor: isMatch ? '#f59e0b' : 'transparent', borderLeftWidth: isMatch ? 3 : 0 }}
+                                                                        onMouseEnter={e => { if (!isMatch) e.currentTarget.style.background = '#f8fafc'; }}
+                                                                        onMouseLeave={e => { if (!isMatch) e.currentTarget.style.background = 'transparent'; }}>
+                                                                        <span style={{ color: isMatch ? '#92400e' : '#374151', fontWeight: isMatch ? 700 : 400 }} className="text-[10px] font-mono truncate flex-1">{colName}</span>
+                                                                        <span className="text-[9px] text-gray-400 font-mono shrink-0">{colType}</span>
+                                                                        {isMatch && <span className="text-amber-500 text-[10px] shrink-0">●</span>}
+                                                                    </div>
+                                                                );
+                                                            })}
+                                                        </div>
+                                                    );
+                                                })}
+                                            </div>
+                                        </div>
+                                        {li < activeLayers.length - 1 && (
+                                            <div className="flex items-center shrink-0" style={{ paddingTop: 18 }}>
+                                                <div style={{ background: appColor + '50', width: 20, height: 2 }} />
+                                                <svg width="8" height="12" viewBox="0 0 8 12" fill={appColor + '80'}><path d="M0,0 L8,6 L0,12 Z" /></svg>
+                                            </div>
+                                        )}
+                                    </React.Fragment>
+                                );
+                            })}
+                        </div>
+                    </>
+                )}
+            </div>
+        </div>
+    );
+}
+EOF
+
 
 # ==========================================
 # 5. ENVIRONMENT FILES HANDLING (PRESERVE IF EXIST)
@@ -8763,11 +8907,37 @@ DEFAULT_ADMIN_USER=admin
 # Change this after first login
 DEFAULT_ADMIN_PASSWORD=CHANGE_ME_ON_FIRST_LOGIN
 
+# Default fallback credentials for Hive & StarRocks connections (set to your actual cluster defaults)
+HIVE_DEFAULT_USER=hadoop
+HIVE_DEFAULT_PASSWORD=
+SR_DEFAULT_USER=root
+
 # Webhook shared secret — callers must send this as X-Webhook-Secret header
 WEBHOOK_SECRET=${NEW_WEBHOOK_SECRET}
 EOF
 else
     echo "✅ backend/.env already exists. Preserving your configuration."
+fi
+
+# Harden .env file permissions — secrets must not be world-readable
+chmod 600 "$APP_DIR/backend/.env" 2>/dev/null || true
+chmod 600 "$APP_DIR/frontend/.env" 2>/dev/null || true
+
+# Create .gitignore to prevent accidental secret commits
+if [ ! -f "$APP_DIR/.gitignore" ]; then
+    echo "Creating .gitignore to protect secrets..."
+    cat << 'GITIGNORE' > "$APP_DIR/.gitignore"
+# Secrets — never commit these
+backend/.env
+frontend/.env
+*.pem
+*.key
+*.crt
+
+# Build artefacts
+frontend/dist/
+**/node_modules/
+GITIGNORE
 fi
 
 # ==========================================
@@ -8806,28 +8976,51 @@ fi
 # 8. POST-INSTALL SECURITY CHECK
 # ==========================================
 echo ""
-echo "🔒 Security checklist for backend/.env:"
+echo "Security checklist for backend/.env:"
 NEEDS_REVIEW=0
 for VAR in PG_PASSWORD LLM_API_KEY ENCRYPTION_KEY SSL_PASSPHRASE JWT_SECRET DEFAULT_ADMIN_PASSWORD WEBHOOK_SECRET; do
     VALUE=$(grep "^${VAR}=" "$APP_DIR/backend/.env" 2>/dev/null | cut -d= -f2- | tr -d '"')
     if [ -z "$VALUE" ] || [ "$VALUE" = "CHANGE_ME" ] || [ "$VALUE" = "CHANGE_ME_ON_FIRST_LOGIN" ]; then
-        echo "   ⚠️  $VAR is not set or still placeholder — update backend/.env before starting"
+        echo "   [WARN] $VAR is not set or still placeholder — update backend/.env before starting"
         NEEDS_REVIEW=1
     fi
 done
 if [ "$NEEDS_REVIEW" -eq 0 ]; then
-    echo "   ✅ All required secrets are set."
+    echo "   [OK] All required secrets are set."
 fi
+
+# ==========================================
+# 9. AUTO-LAUNCH WITH PM2
+# ==========================================
 echo ""
-echo "✅ Enterprise App rebuilt successfully!"
-echo "---------------------------------------------------"
-echo "IMPORTANT: Edit backend/.env and frontend/.env before starting services."
-echo "           Ensure no CHANGE_ME placeholders remain."
+echo "Launching Data Explorer with PM2..."
+
+# Stop existing instances cleanly if running
+pm2 stop ecosystem.config.js --silent 2>/dev/null || true
+pm2 delete ecosystem.config.js --silent 2>/dev/null || true
+
+cd "$APP_DIR"
+pm2 start ecosystem.config.js
+
+# Persist PM2 process list so it survives reboots
+pm2 save
+
 echo ""
-echo "To start your services, run:"
+echo "=================================================="
+echo " Data Explorer deployed and running!"
+echo "=================================================="
+pm2 list
 echo ""
-echo "cd /opt/data-explorer-app"
-echo "pm2 start ecosystem.config.js"
-echo "pm2 save"
-echo "pm2 startup"
-echo "---------------------------------------------------"
+echo "Useful commands:"
+echo "  pm2 logs          -- stream all logs"
+echo "  pm2 logs backend  -- backend logs only"
+echo "  pm2 restart all   -- restart after .env changes"
+echo "  pm2 stop all      -- stop all services"
+echo ""
+if [ "$NEEDS_REVIEW" -eq 1 ]; then
+    echo "[ACTION REQUIRED] Update CHANGE_ME values in:"
+    echo "  $APP_DIR/backend/.env"
+    echo "  $APP_DIR/frontend/.env"
+    echo "Then run: pm2 restart all"
+fi
+echo "=================================================="
