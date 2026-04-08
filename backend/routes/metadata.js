@@ -1,4 +1,5 @@
 const express = require('express'); const router = express.Router(); const mysql = require('mysql2/promise'); const { pgPool } = require('../db'); const { getConnConfig } = require('../utils/crypto');
+const rateLimit = require('express-rate-limit');
 const { requireRole } = require('../middleware/rbac');
 const { isIdentifier, validateConnectionId, validateTableRef } = require('../middleware/validate');
 const { requireConnectionAccess } = require('../middleware/access');
@@ -21,6 +22,8 @@ router.post('/save', requireRole('admin'), async (req, res) => {
     } catch (e) { console.error("[Metadata Save Error]:", e); res.status(500).json({ error: "Failed to save metadata." }); }
 });
 
+const llmLimiter = rateLimit({ windowMs: 60*60*1000, max: 50, keyGenerator: req => req.user?.username || req.ip, message: { error: 'LLM rate limit exceeded. Try again in an hour.' } });
+
 // Allowlist for LLM models
 const ALLOWED_LLM_MODELS = new Set([
     'gpt-4o', 'gpt-4o-mini', 'gpt-4-turbo', 'gpt-4', 'gpt-3.5-turbo',
@@ -29,7 +32,7 @@ const ALLOWED_LLM_MODELS = new Set([
     'meta-llama/llama-3.1-70b-instruct', 'meta-llama/llama-3.1-8b-instruct',
 ]);
 
-router.post('/generate', requireRole('admin'), async (req, res) => {
+router.post('/generate', requireRole('admin'), llmLimiter, async (req, res) => {
     try {
         const { connection_id, db_name, table_name } = req.body;
         const schema = Array.isArray(req.body.schema) ? req.body.schema.slice(0, 200) : [];

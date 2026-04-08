@@ -33,6 +33,7 @@ async function getTableCountSingle(pool, catalogName, connType) {
             if (rows.length > 0) return rows.filter(r => !TABLE_EXCLUDE_RE.test(r.tbl)).length;
 
             // Fallback: enumerate databases then batch-count tables
+            if (!catalogName || !/^[a-zA-Z0-9_\-]+$/.test(catalogName)) return 0;
             const [dbRows] = await pool.query(`SHOW DATABASES FROM \`${catalogName}\``);
             const dbs = dbRows.map(r => Object.values(r)[0])
                               .filter(d => !SYSTEM_DBS.includes(d.toLowerCase()));
@@ -82,7 +83,7 @@ router.get('/stats', async (req, res) => {
                 const airflowDb = new Client({
                     host: conn.host, port: conn.port || 5432, user: conn.username,
                     password: decrypt(conn.password), database: conn.sr_username || 'airflow',
-                    ssl: { rejectUnauthorized: false }
+                    ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: true } : false
                 });
                 try {
                     await airflowDb.connect();
@@ -168,7 +169,7 @@ router.post('/global-search', async (req, res) => {
                 const airflowDb = new Client({
                     host: conn.host, port: conn.port || 5432, user: conn.username,
                     password: decrypt(conn.password), database: conn.sr_username || 'airflow',
-                    ssl: { rejectUnauthorized: false }
+                    ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: true } : false
                 });
                 try {
                     await airflowDb.connect();

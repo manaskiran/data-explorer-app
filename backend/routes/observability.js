@@ -50,7 +50,7 @@ router.post('/calculate', requireConnectionAccess('connection_id'), async (req, 
             if (conn.type === 'hive') await connection.query('SET CATALOG hudi_catalog;');
             let isHudi = false; try { const [schemaCols] = await connection.query(`DESCRIBE \`${db_name}\`.\`${table_name}\``); isHudi = schemaCols.some(c => c.Field === '_hoodie_record_key'); } catch(e) { console.warn('[Observability] Hudi check failed:', e.message); }
             if (isHudi) {
-                const [totalResult] = await connection.query(`SELECT COUNT(DISTINCT \`_hoodie_record_key\`) as count FROM \`${db_name}\`.\`${table_name}\``); const [todayResult] = await connection.query(`SELECT COUNT(DISTINCT \`_hoodie_record_key\`) as count FROM \`${db_name}\`.\`${table_name}\` WHERE \`_hoodie_commit_time\` LIKE '${todayStr}%'`); total = Number(totalResult[0].count); today = Number(todayResult[0].count); previous = total - today; typeStr = 'starrocks_hudi_fast';
+                const [totalResult] = await connection.query(`SELECT COUNT(DISTINCT \`_hoodie_record_key\`) as count FROM \`${db_name}\`.\`${table_name}\``); const [todayResult] = await connection.query(`SELECT COUNT(DISTINCT \`_hoodie_record_key\`) as count FROM \`${db_name}\`.\`${table_name}\` WHERE \`_hoodie_commit_time\` LIKE ?`, [todayStr + '%']); total = Number(totalResult[0].count); today = Number(todayResult[0].count); previous = total - today; typeStr = 'starrocks_hudi_fast';
             } else { const [totalResult] = await connection.query(`SELECT COUNT(*) as count FROM \`${db_name}\`.\`${table_name}\``); total = Number(totalResult[0].count); today = null; previous = null; }
         } finally { await connection.end(); }
         await pgPool.query(

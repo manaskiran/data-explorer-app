@@ -252,6 +252,7 @@ router.post('/explore/query', requireConnectionAccess('connection_id'), async (r
 
         try {
             if (conn.type === 'hive') await connection.query('SET CATALOG hudi_catalog;');
+            if (db_name && !isValidIdentifier(db_name)) { await connection.end(); return res.status(400).json({ error: 'Invalid database name' }); }
             if (db_name) await connection.query(`USE \`${db_name}\``);
             const [dataRows] = await connection.query(execQuery);
             results = dataRows;

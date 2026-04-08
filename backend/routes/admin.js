@@ -43,6 +43,16 @@ router.patch('/users/:id/role', async (req, res) => {
             'UPDATE explorer_users SET role = $1 WHERE id = $2', [role, targetId]
         );
         if (!rowCount) return res.status(404).json({ error: 'User not found.' });
+        await pgPool.query(
+            `CREATE TABLE IF NOT EXISTS explorer_audit_log (
+                id SERIAL PRIMARY KEY, action TEXT NOT NULL, admin_username TEXT NOT NULL,
+                target_user_id INT, details JSONB, created_at TIMESTAMPTZ DEFAULT NOW()
+            )`
+        );
+        await pgPool.query(
+            `INSERT INTO explorer_audit_log (action, admin_username, target_user_id, details) VALUES ($1, $2, $3, $4)`,
+            ['role_change', req.user.username, targetId, JSON.stringify({ new_role: role })]
+        );
         res.json({ success: true });
     } catch (e) {
         console.error('[Admin Role Change Error]:', e.message);
@@ -64,10 +74,23 @@ router.delete('/users/:id', async (req, res) => {
             return res.status(400).json({ error: 'You cannot delete your own account.' });
         }
 
+        const { rows: targetRows } = await pgPool.query(
+            'SELECT username FROM explorer_users WHERE id = $1', [targetId]
+        );
         const { rowCount } = await pgPool.query(
             'DELETE FROM explorer_users WHERE id = $1', [targetId]
         );
         if (!rowCount) return res.status(404).json({ error: 'User not found.' });
+        await pgPool.query(
+            `CREATE TABLE IF NOT EXISTS explorer_audit_log (
+                id SERIAL PRIMARY KEY, action TEXT NOT NULL, admin_username TEXT NOT NULL,
+                target_user_id INT, details JSONB, created_at TIMESTAMPTZ DEFAULT NOW()
+            )`
+        );
+        await pgPool.query(
+            `INSERT INTO explorer_audit_log (action, admin_username, target_user_id, details) VALUES ($1, $2, $3, $4)`,
+            ['user_delete', req.user.username, targetId, JSON.stringify({ deleted_username: targetRows[0]?.username })]
+        );
         res.json({ success: true });
     } catch (e) {
         console.error('[Admin Delete User Error]:', e.message);
