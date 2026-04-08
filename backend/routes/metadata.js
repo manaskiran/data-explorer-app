@@ -29,10 +29,7 @@ const ALLOWED_LLM_MODELS = new Set([
     'meta-llama/llama-3.1-70b-instruct', 'meta-llama/llama-3.1-8b-instruct',
 ]);
 
-const rateLimit = require('express-rate-limit');
-const llmLimiter = rateLimit({ windowMs: 60*60*1000, max: 50, keyGenerator: req => req.user?.username || req.ip, message: { error: 'LLM rate limit exceeded. Try again in an hour.' } });
-
-router.post('/generate', requireRole('admin'), llmLimiter, async (req, res) => {
+router.post('/generate', requireRole('admin'), async (req, res) => {
     try {
         const { connection_id, db_name, table_name } = req.body;
         const schema = Array.isArray(req.body.schema) ? req.body.schema.slice(0, 200) : [];
