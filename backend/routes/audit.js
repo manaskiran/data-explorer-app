@@ -14,7 +14,7 @@ const getAirflowDb = async (connection_id) => {
     const airflowDb = new Client({
         host: conn.host, port: conn.port || 5432, user: conn.username,
         password: decrypt(conn.password), database: conn.sr_username || 'airflow',
-        ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: true } : false
+        ssl: { rejectUnauthorized: false }
     });
     await airflowDb.connect();
     const uiUrl = conn.ui_url ? conn.ui_url : `https://${conn.host}:8080`;

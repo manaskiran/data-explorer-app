@@ -33,7 +33,7 @@ async function runGlobalObservabilityScan() {
                             try { const [schemaCols] = await mysqlConn.query(`DESCRIBE \`${db}\`.\`${table}\``); isHudi = schemaCols.some(c => c.Field === '_hoodie_record_key'); } catch(e) { console.warn(`[Cron] Hudi check failed for ${db}.${table}:`, e.message); }
                             if (isHudi) {
                                 const [totalResult] = await mysqlConn.query(`SELECT COUNT(DISTINCT \`_hoodie_record_key\`) as count FROM \`${db}\`.\`${table}\``);
-                                const [todayResult] = await mysqlConn.query(`SELECT COUNT(DISTINCT \`_hoodie_record_key\`) as count FROM \`${db}\`.\`${table}\` WHERE \`_hoodie_commit_time\` LIKE ?`, [todayStr + '%']);
+                                const [todayResult] = await mysqlConn.query(`SELECT COUNT(DISTINCT \`_hoodie_record_key\`) as count FROM \`${db}\`.\`${table}\` WHERE \`_hoodie_commit_time\` LIKE '${todayStr}%'`);
                                 total = Number(totalResult[0].count); today = Number(todayResult[0].count); previous = total - today;
                             } else {
                                 const [totalResult] = await mysqlConn.query(`SELECT COUNT(*) as count FROM \`${db}\`.\`${table}\``);
