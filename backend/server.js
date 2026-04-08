@@ -326,7 +326,6 @@ const enforceAuth = (req, res, next) => {
                 next();
             })
             .catch(() => {
-                // Fail secure — never fall back to stale token role
                 console.error('[Auth] DB unreachable during role check — rejecting request');
                 return res.status(503).json({ error: 'Service temporarily unavailable. Please retry.' });
             });
