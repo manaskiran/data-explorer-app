@@ -27,12 +27,21 @@ const lineageRoutes     = require('./routes/lineage');
 // ─── Startup guards ───────────────────────────────────────────────────────────
 const REQUIRED_ENV = ['JWT_SECRET', 'ENCRYPTION_KEY', 'PG_USER', 'PG_HOST',
                       'PG_DATABASE', 'PG_PASSWORD', 'DEFAULT_ADMIN_USER',
-                      'DEFAULT_ADMIN_PASSWORD', 'SSL_KEY_PATH', 'SSL_CERT_PATH'];
+                      'DEFAULT_ADMIN_PASSWORD'];
 const missing = REQUIRED_ENV.filter(k => !process.env[k]);
 if (missing.length) {
     console.error(`[FATAL] Missing required environment variables: ${missing.join(', ')}`);
     process.exit(1);
 }
+
+// Detect HTTPS mode: only enabled when both cert files exist on disk
+const USE_HTTPS = (() => {
+    const k = process.env.SSL_KEY_PATH;
+    const c = process.env.SSL_CERT_PATH;
+    if (!k || !c) return false;
+    try { fs.accessSync(k); fs.accessSync(c); return true; } catch { return false; }
+})();
+if (!USE_HTTPS) console.warn('[WARN] SSL certs not found — starting in HTTP mode (dev only)');
 
 process.on('uncaughtException',  (err)    => console.error('[CRITICAL] Uncaught exception:',    err.message));
 process.on('unhandledRejection', (reason) => console.error('[CRITICAL] Unhandled rejection:',   reason));
@@ -237,7 +246,7 @@ app.post('/api/auth/login', async (req, res) => {
 
         const user = rows[0];
         const token = jwt.sign({ username: user.username, role: user.role }, process.env.JWT_SECRET, { expiresIn: '2h', algorithm: 'HS256' });
-        res.cookie('token', token, { httpOnly: true, secure: true, sameSite: 'strict', maxAge: 2 * 60 * 60 * 1000 });
+        res.cookie('token', token, { httpOnly: true, secure: USE_HTTPS, sameSite: 'lax', maxAge: 2 * 60 * 60 * 1000 });
         res.json({ user: { username: user.username, role: user.role } });
     } catch (err) {
         console.error('[Login Error]:', err.message);
@@ -260,7 +269,7 @@ app.post('/api/auth/signup', async (req, res) => {
         await pgPool.query('INSERT INTO explorer_users (username, password, role) VALUES ($1,$2,$3)', [username, hashed, 'viewer']);
 
         const token = jwt.sign({ username, role: 'viewer' }, process.env.JWT_SECRET, { expiresIn: '2h', algorithm: 'HS256' });
-        res.cookie('token', token, { httpOnly: true, secure: true, sameSite: 'strict', maxAge: 2 * 60 * 60 * 1000 });
+        res.cookie('token', token, { httpOnly: true, secure: USE_HTTPS, sameSite: 'lax', maxAge: 2 * 60 * 60 * 1000 });
         res.status(201).json({ user: { username, role: 'viewer' } });
     } catch (err) {
         console.error('[Signup Error]:', err.message);
@@ -326,7 +335,7 @@ const enforceAuth = (req, res, next) => {
 
 // ─── Logout ───────────────────────────────────────────────────────────────────
 app.post('/api/auth/logout', (req, res) => {
-    res.clearCookie('token', { httpOnly: true, secure: true, sameSite: 'strict' });
+    res.clearCookie('token', { httpOnly: true, secure: USE_HTTPS, sameSite: 'lax' });
     res.json({ success: true });
 });
 
@@ -348,7 +357,7 @@ app.post('/api/auth/change-password', enforceAuth, async (req, res) => {
         await pgPool.query('UPDATE explorer_users SET password = $1 WHERE username = $2', [hashed, req.user.username]);
         // Rotate the session cookie after password change
         const newToken = jwt.sign({ username: req.user.username, role: req.user.role }, process.env.JWT_SECRET, { expiresIn: '2h', algorithm: 'HS256' });
-        res.cookie('token', newToken, { httpOnly: true, secure: true, sameSite: 'strict', maxAge: 2 * 60 * 60 * 1000 });
+        res.cookie('token', newToken, { httpOnly: true, secure: USE_HTTPS, sameSite: 'lax', maxAge: 2 * 60 * 60 * 1000 });
         res.json({ success: true });
     } catch (err) {
         console.error('[Change Password Error]:', err.message);
@@ -374,15 +383,20 @@ app.use((err, req, res, next) => {
     res.status(500).json({ error: 'Internal Server Error' });
 });
 
-// ─── HTTPS server + graceful shutdown ─────────────────────────────────────────
+// ─── HTTP / HTTPS server + graceful shutdown ──────────────────────────────────
 const PORT = process.env.PORT || 5000;
-const sslOptions = {
-    key:        fs.readFileSync(process.env.SSL_KEY_PATH, 'utf8'),
-    cert:       fs.readFileSync(process.env.SSL_CERT_PATH, 'utf8'),
-    passphrase: process.env.SSL_PASSPHRASE,
-};
 
-const server = https.createServer(sslOptions, app);
+let server;
+if (USE_HTTPS) {
+    const sslOptions = {
+        key:        fs.readFileSync(process.env.SSL_KEY_PATH, 'utf8'),
+        cert:       fs.readFileSync(process.env.SSL_CERT_PATH, 'utf8'),
+        passphrase: process.env.SSL_PASSPHRASE,
+    };
+    server = https.createServer(sslOptions, app);
+} else {
+    server = require('http').createServer(app);
+}
 
 const shutdown = async (signal) => {
     console.log(`[INFO] ${signal} received — starting graceful shutdown...`);
@@ -401,6 +415,7 @@ process.on('SIGINT',  () => shutdown('SIGINT'));
 server.listen(PORT, async () => {
     await initDb();
     startCronJobs();
-    console.log(JSON.stringify({ level: 'INFO', timestamp: new Date().toISOString(), message: `Secure backend running on port ${PORT}` }));
+    const proto = USE_HTTPS ? 'HTTPS' : 'HTTP';
+    console.log(JSON.stringify({ level: 'INFO', timestamp: new Date().toISOString(), message: `Backend running on port ${PORT} (${proto})` }));
 });
 

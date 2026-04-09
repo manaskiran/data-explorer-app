@@ -1,14 +1,7 @@
 import axios from 'axios';
 
-// Resolve API base URL from env, replacing hostname at runtime for flexible deploys
-let BASE = import.meta.env.VITE_API_URL || '/api';
-if (BASE.startsWith('http')) {
-    try {
-        const u = new URL(BASE);
-        u.hostname = window.location.hostname;
-        BASE = u.toString().replace(/\/$/, '');
-    } catch(e) {}
-}
+// Use the configured API URL as-is so the SSL cert hostname always matches
+const BASE = (import.meta.env.VITE_API_URL || '/api').replace(/\/$/, '');
 export const API = BASE;
 
 // Shared axios instance — uses HttpOnly cookie for auth (withCredentials)
