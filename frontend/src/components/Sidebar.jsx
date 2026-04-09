@@ -32,6 +32,10 @@ export default function Sidebar() {
                 </div>
             </div>
             <div className="p-4 space-y-2 flex-1">
+                <button onClick={() => navigate('/')} className="w-full flex items-center gap-2 px-3 py-2 rounded-lg text-xs font-bold text-gray-400 hover:text-indigo-600 hover:bg-white transition-all mb-1 border border-transparent hover:border-gray-200">
+                    <i className="fas fa-arrow-left text-[11px]"></i> All Tools
+                </button>
+                <div className="border-t border-gray-200 mb-2"></div>
                 <button onClick={() => navigate('/home')} className={`w-full flex items-center gap-3 px-4 py-3 rounded-lg font-bold text-sm transition-all ${isActive('/home') ? 'bg-indigo-600 text-white shadow-md shadow-indigo-200' : 'text-gray-600 hover:bg-white hover:text-indigo-600'}`}>
                     <i className="fas fa-home w-5 text-center text-lg"></i> Home
                 </button>
