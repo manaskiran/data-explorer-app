@@ -126,27 +126,25 @@ router.post('/search/fetch', requireConnectionAccess('id'), async (req, res) => 
         const conn = rows[0]; conn.password = decrypt(conn.password); conn.sr_password = decrypt(conn.sr_password);
         if (conn.type === 'starrocks') { const connection = await getSrConnection(conn.host, conn.port, conn.username, conn.password); const [result] = await connection.query(`SELECT TABLE_SCHEMA as db, TABLE_NAME as tbl, COLUMN_NAME as col FROM information_schema.columns WHERE COLUMN_NAME LIKE ? LIMIT 100`, [`%${col}%`]); await connection.end(); res.json(result); } 
         else if (conn.type === 'hive') {
-            if (!globalHiveCache[id]) globalHiveCache[id] = {}; const myCache = globalHiveCache[id]; let setup = await setupHiveClient(conn);
+            // Use StarRocks MySQL bridge (hudi_catalog) — same approach as /explore/fetch.
+            // Direct Hive TCP (port 10000) is unreliable and always times out.
+            const connection = await getSrConnection(
+                conn.host, 9030,
+                conn.sr_username || process.env.SR_DEFAULT_USER || 'root',
+                decrypt(conn.sr_password) || ''
+            );
             try {
-                let results = []; const startTime = Date.now(); let timeLimitHit = false; const safeQuery = async (q, t) => Promise.race([ setup.executeQuery(q), new Promise((_, r) => setTimeout(() => r(new Error('TIMEOUT')), t)) ]);
-                const dbRows = await safeQuery('SHOW DATABASES', 15000); const dbs = (dbRows || []).map(r => Object.values(r)[0]).filter(d => d && d !== 'information_schema' && d !== 'sys');
-                for (let i = 0; i < dbs.length; i++) {
-                    if (timeLimitHit) break;
-                    try {
-                        const tableRows = await safeQuery(`SHOW TABLES IN \`${dbs[i]}\``, 10000); const tables = (tableRows || []).map(r => Object.values(r)[Object.values(r).length - 1]);
-                        for (let j = 0; j < tables.length; j += 10) {
-                            if (Date.now() - startTime > 55000 || results.length >= 100) { timeLimitHit = true; break; }
-                            await Promise.all(tables.slice(j, j + 10).map(async (tName) => {
-                                const cacheKey = `${dbs[i]}.${tName}`; let columns = myCache[cacheKey]; 
-                                if (!columns || (myCache[`${cacheKey}__ts`] && Date.now() - myCache[`${cacheKey}__ts`] > HIVE_CACHE_TTL_MS)) {
-                                    try { const schema = await safeQuery(`DESCRIBE \`${dbs[i]}\`.\`${tName}\``, 6000); if (schema && schema.length > 0) { columns = schema.filter(r => r.col_name).map(r => r.col_name); hiveCacheEvict(myCache); myCache[cacheKey] = columns; myCache[`${cacheKey}__ts`] = Date.now(); } else { columns = []; } } catch(e) { console.warn(`[HiveCache] DESCRIBE failed for ${cacheKey}:`, e.message); columns = []; } }
-                                for (let c of columns) { if (c.toLowerCase().includes(col.toLowerCase())) results.push({ db: dbs[i], tbl: tName, col: c }); }
-                            }));
-                        }
-                    } catch(e) { console.warn(`[HiveSearch] DB ${dbs[i]} error:`, e.message); }
-                }
-                res.json(results);
-            } catch (e) { res.status(500).json({ error: "Hive cluster disconnected." }); } finally { try{if(setup.session) await setup.session.close();}catch(e){} try{if(setup.client) await setup.client.close();}catch(e){} }
+                await connection.query('SET CATALOG hudi_catalog;');
+                const [result] = await connection.query(
+                    `SELECT TABLE_SCHEMA AS db, TABLE_NAME AS tbl, COLUMN_NAME AS col
+                     FROM information_schema.columns
+                     WHERE COLUMN_NAME LIKE ?
+                       AND TABLE_SCHEMA NOT IN ('information_schema', 'sys', 'hudi_metadata')
+                     LIMIT 100`,
+                    [`%${col}%`]
+                );
+                res.json(result);
+            } finally { await connection.end(); }
         }
     } catch (e) { console.error("[Search Fetch Error]:", e); res.status(500).json({ error: "Failed to perform global search." }); }
 });
