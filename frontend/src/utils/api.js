@@ -1,7 +1,21 @@
 import axios from 'axios';
 
-// Use the configured API URL as-is so the SSL cert hostname always matches
-const BASE = (import.meta.env.VITE_API_URL || '/api').replace(/\/$/, '');
+// Build API URL dynamically from the current browser's origin so the app works
+// on any IP, hostname, or localhost without changing config.
+// VITE_API_URL provides the backend port (and optional path prefix) — hostname
+// and scheme are always replaced with whatever the browser is currently using.
+let BASE = '/api';
+const _configured = import.meta.env.VITE_API_URL;
+if (_configured) {
+    try {
+        const _u = new URL(_configured);
+        _u.protocol = window.location.protocol;   // match current scheme (http/https)
+        _u.hostname = window.location.hostname;   // match current host (IP or hostname)
+        BASE = _u.toString().replace(/\/$/, '');
+    } catch (_) {
+        BASE = _configured.replace(/\/$/, '');
+    }
+}
 export const API = BASE;
 
 // Shared axios instance — uses HttpOnly cookie for auth (withCredentials)
