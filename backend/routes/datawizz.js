@@ -732,7 +732,6 @@ router.post('/schema', async (req, res) => {
 
 // ── Superset Connection Store (CRUD) ─────────────────────────────────────────
 
-/** Resolve Superset credentials: prefer stored connection, fall back to inline body params */
 async function resolveSuperset(body) {
     if (body.superset_connection_id) {
         const { rows } = await pgPool.query(
@@ -743,59 +742,37 @@ async function resolveSuperset(body) {
         return { url: rows[0].url, username: rows[0].username, password: decrypt(rows[0].password) };
     }
     const { url, username, password } = body;
-    if (!url || !username || !password) {
-        throw new Error('superset_connection_id or (url + username + password) are required.');
-    }
+    if (!url || !username || !password) throw new Error('superset_connection_id or (url + username + password) are required.');
     return { url, username, password };
 }
 
-/** POST /api/datawizz/superset/connections — save encrypted Superset credentials */
 router.post('/superset/connections', async (req, res) => {
     try {
         const { name, url, username, password } = req.body;
-        if (!name || !url || !username || !password) {
-            return res.status(400).json({ error: 'name, url, username, and password are required.' });
-        }
+        if (!name || !url || !username || !password) return res.status(400).json({ error: 'name, url, username, and password are required.' });
         await pgPool.query(
-            `INSERT INTO explorer_superset_connections (name, url, username, password, created_by)
-             VALUES ($1, $2, $3, $4, $5)
-             ON CONFLICT (name) DO UPDATE SET url=$2, username=$3, password=$4, created_by=$5`,
+            `INSERT INTO explorer_superset_connections (name, url, username, password, created_by) VALUES ($1,$2,$3,$4,$5) ON CONFLICT (name) DO UPDATE SET url=$2, username=$3, password=$4, created_by=$5`,
             [name, url, username, encrypt(password), req.user.username]
         );
         res.status(201).json({ success: true });
-    } catch (e) {
-        console.error('[Superset Conn Save Error]:', e.message);
-        res.status(500).json({ error: 'Failed to save Superset connection.' });
-    }
+    } catch (e) { console.error('[Superset Conn Save Error]:', e.message); res.status(500).json({ error: 'Failed to save Superset connection.' }); }
 });
 
-/** GET /api/datawizz/superset/connections — list saved connections (passwords masked) */
 router.get('/superset/connections', async (req, res) => {
     try {
-        const { rows } = await pgPool.query(
-            'SELECT id, name, url, username, created_by, created_at FROM explorer_superset_connections ORDER BY name ASC'
-        );
+        const { rows } = await pgPool.query('SELECT id, name, url, username, created_by, created_at FROM explorer_superset_connections ORDER BY name ASC');
         res.json(rows);
-    } catch (e) {
-        console.error('[Superset Conn List Error]:', e.message);
-        res.status(500).json({ error: 'Failed to list Superset connections.' });
-    }
+    } catch (e) { console.error('[Superset Conn List Error]:', e.message); res.status(500).json({ error: 'Failed to list Superset connections.' }); }
 });
 
-/** DELETE /api/datawizz/superset/connections/:id — delete a stored connection */
 router.delete('/superset/connections/:id', async (req, res) => {
     const id = parseInt(req.params.id, 10);
     if (!id) return res.status(400).json({ error: 'Invalid connection ID.' });
     try {
-        const { rowCount } = await pgPool.query(
-            'DELETE FROM explorer_superset_connections WHERE id = $1', [id]
-        );
+        const { rowCount } = await pgPool.query('DELETE FROM explorer_superset_connections WHERE id = $1', [id]);
         if (!rowCount) return res.status(404).json({ error: 'Connection not found.' });
         res.json({ success: true });
-    } catch (e) {
-        console.error('[Superset Conn Delete Error]:', e.message);
-        res.status(500).json({ error: 'Failed to delete Superset connection.' });
-    }
+    } catch (e) { console.error('[Superset Conn Delete Error]:', e.message); res.status(500).json({ error: 'Failed to delete Superset connection.' }); }
 });
 
 /** POST /api/datawizz/superset/test — test Superset credentials or stored connection */
@@ -819,9 +796,7 @@ router.post('/superset/datasets', async (req, res) => {
         await client.authenticate();
         const datasets = await client.listDatasets();
         res.json(datasets);
-    } catch (e) {
-        res.status(500).json({ error: e.message });
-    }
+    } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 /**
@@ -956,21 +931,16 @@ router.get('/plan', async (req, res) => {
  * POST /api/datawizz/build — SSE endpoint
  * Builds charts + dashboard in Superset and runs QA review.
  *
- * Body: { plan, datasetInfo, dataset_name, superset_url, superset_username, superset_password, dashboard_id? }
+ * Body: { plan, datasetInfo, dataset_name, superset_connection_id | (superset_url+superset_username+superset_password), dashboard_id? }
  */
 router.post('/build', async (req, res) => {
     const { plan, datasetInfo, dataset_name, dashboard_id } = req.body;
-
     if (!plan || !dataset_name) {
         return res.status(400).json({ error: 'plan and dataset_name are required.' });
     }
-
     let supersetCreds;
-    try {
-        supersetCreds = await resolveSuperset(req.body);
-    } catch (e) {
-        return res.status(400).json({ error: e.message });
-    }
+    try { supersetCreds = await resolveSuperset(req.body); }
+    catch (e) { return res.status(400).json({ error: e.message }); }
 
     res.setHeader('Content-Type', 'text/event-stream');
     res.setHeader('Cache-Control', 'no-cache');

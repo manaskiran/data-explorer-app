@@ -79,7 +79,7 @@ const withTimeout = async (promise, ms, label) => {
 
 const setupHiveClient = async (conn) => {
   const host = conn.host; const port = Number(conn.port) || 10000;
-  const authUser = (conn.username && conn.username.trim()) ? conn.username.trim() : 'hadoop';
+  const authUser = (conn.username && conn.username.trim()) ? conn.username.trim() : (process.env.HIVE_DEFAULT_USER || 'hadoop');
   const authPass = conn.password ? decrypt(conn.password) : '';
   let client = new hive.HiveClient(TCLIService, TCLIService_types);
   client.on('error', () => {});

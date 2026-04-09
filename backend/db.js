@@ -111,6 +111,17 @@ const initDb = async () => {
         await silentDDL("CREATE INDEX IF NOT EXISTS idx_obs_conn_table          ON explorer_observability(connection_id, db_name, table_name)");
         await silentDDL("CREATE INDEX IF NOT EXISTS idx_obs_measured_at         ON explorer_observability(measured_at DESC)");
         await silentDDL("CREATE INDEX IF NOT EXISTS idx_obs_target_date         ON explorer_observability(target_date)");
+        // Deduplicate observability rows before creating unique index (keeps newest row per group)
+        await silentDDL(`
+            DELETE FROM explorer_observability a USING explorer_observability b
+            WHERE a.id < b.id
+              AND a.connection_id IS NOT DISTINCT FROM b.connection_id
+              AND a.db_name       = b.db_name
+              AND a.table_name    = b.table_name
+              AND a.target_date IS NOT DISTINCT FROM b.target_date
+        `);
+        // Remove rows with NULL target_date that cannot participate in the unique constraint
+        await silentDDL("DELETE FROM explorer_observability WHERE target_date IS NULL");
         await silentDDL("CREATE UNIQUE INDEX IF NOT EXISTS idx_obs_upsert_key   ON explorer_observability(connection_id, db_name, table_name, target_date)");
         await silentDDL("CREATE INDEX IF NOT EXISTS idx_users_role              ON explorer_users(role)");
         await silentDDL("CREATE INDEX IF NOT EXISTS idx_conn_perm_user          ON explorer_connection_permissions(user_id)");

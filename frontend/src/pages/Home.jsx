@@ -10,6 +10,7 @@ export default function Home() {
 
     const [searchQuery, setSearchQuery] = useState('');
     const [searchResults, setSearchResults] = useState([]);
+    const [searchTotal, setSearchTotal] = useState(0);
     const [showSearch, setShowSearch] = useState(false);
     const [isSearching, setIsSearching] = useState(false);
 
@@ -24,12 +25,13 @@ export default function Home() {
         const delayDebounceFn = setTimeout(() => {
             if (searchQuery.length >= 2) {
                 setIsSearching(true);
-                api.post(`${API}/home/global-search`, { query: searchQuery })
-                     .then(res => setSearchResults(res.data))
+                api.post(`${API}/home/global-search`, { query: searchQuery, limit: 100 })
+                     .then(res => { setSearchResults(res.data.results || []); setSearchTotal(res.data.total || 0); })
                      .catch(err => console.error(err))
                      .finally(() => setIsSearching(false));
             } else {
                 setSearchResults([]);
+                setSearchTotal(0);
             }
         }, 400); 
         return () => clearTimeout(delayDebounceFn);
@@ -98,7 +100,7 @@ export default function Home() {
                                     <div className="bg-gray-50/95 backdrop-blur-sm border-b border-gray-100 px-5 py-3 flex justify-between items-center sticky top-0 z-10 shrink-0">
                                         <span className="text-[10px] font-extrabold text-gray-500 uppercase tracking-widest flex items-center"><i className="fas fa-list-ul mr-2"></i>Search Results</span>
                                         {searchResults.length > 0 ? (
-                                            <span className="bg-indigo-100 text-indigo-700 text-[11px] font-black px-2.5 py-1 rounded border border-indigo-200 shadow-sm">{searchResults.length} Matches Found</span>
+                                            <span className="bg-indigo-100 text-indigo-700 text-[11px] font-black px-2.5 py-1 rounded border border-indigo-200 shadow-sm">{searchTotal} Matches Found</span>
                                         ) : (
                                             <span className="bg-gray-200 text-gray-500 text-[11px] font-black px-2.5 py-1 rounded border border-gray-300 shadow-sm">0 Matches</span>
                                         )}

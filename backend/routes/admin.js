@@ -43,6 +43,11 @@ router.patch('/users/:id/role', async (req, res) => {
             'UPDATE explorer_users SET role = $1 WHERE id = $2', [role, targetId]
         );
         if (!rowCount) return res.status(404).json({ error: 'User not found.' });
+
+        // Fire-and-forget audit log — never blocks the response
+        pgPool.query('CREATE TABLE IF NOT EXISTS explorer_audit_log (id SERIAL PRIMARY KEY, actor TEXT, action TEXT, target TEXT, detail TEXT, created_at TIMESTAMPTZ DEFAULT NOW())').catch(() => {});
+        pgPool.query('INSERT INTO explorer_audit_log (actor, action, target, detail) VALUES ($1,$2,$3,$4)', [req.user.username, 'role_change', String(targetId), JSON.stringify({ role })]).catch(() => {});
+
         res.json({ success: true });
     } catch (e) {
         console.error('[Admin Role Change Error]:', e.message);
@@ -68,6 +73,11 @@ router.delete('/users/:id', async (req, res) => {
             'DELETE FROM explorer_users WHERE id = $1', [targetId]
         );
         if (!rowCount) return res.status(404).json({ error: 'User not found.' });
+
+        // Fire-and-forget audit log — never blocks the response
+        pgPool.query('CREATE TABLE IF NOT EXISTS explorer_audit_log (id SERIAL PRIMARY KEY, actor TEXT, action TEXT, target TEXT, detail TEXT, created_at TIMESTAMPTZ DEFAULT NOW())').catch(() => {});
+        pgPool.query('INSERT INTO explorer_audit_log (actor, action, target, detail) VALUES ($1,$2,$3,$4)', [req.user.username, 'user_delete', String(targetId), JSON.stringify({})]).catch(() => {});
+
         res.json({ success: true });
     } catch (e) {
         console.error('[Admin Delete User Error]:', e.message);

@@ -187,6 +187,17 @@ const initDb = async () => {
         await silentDDL("CREATE INDEX IF NOT EXISTS idx_obs_conn_table          ON explorer_observability(connection_id, db_name, table_name)");
         await silentDDL("CREATE INDEX IF NOT EXISTS idx_obs_measured_at         ON explorer_observability(measured_at DESC)");
         await silentDDL("CREATE INDEX IF NOT EXISTS idx_obs_target_date         ON explorer_observability(target_date)");
+        // Deduplicate observability rows before creating unique index (keeps newest row per group)
+        await silentDDL(`
+            DELETE FROM explorer_observability a USING explorer_observability b
+            WHERE a.id < b.id
+              AND a.connection_id IS NOT DISTINCT FROM b.connection_id
+              AND a.db_name       = b.db_name
+              AND a.table_name    = b.table_name
+              AND a.target_date IS NOT DISTINCT FROM b.target_date
+        `);
+        // Remove rows with NULL target_date that cannot participate in the unique constraint
+        await silentDDL("DELETE FROM explorer_observability WHERE target_date IS NULL");
         await silentDDL("CREATE UNIQUE INDEX IF NOT EXISTS idx_obs_upsert_key   ON explorer_observability(connection_id, db_name, table_name, target_date)");
         await silentDDL("CREATE INDEX IF NOT EXISTS idx_users_role              ON explorer_users(role)");
         await silentDDL("CREATE INDEX IF NOT EXISTS idx_conn_perm_user          ON explorer_connection_permissions(user_id)");
@@ -2263,44 +2274,52 @@ async function runGlobalObservabilityScan() {
     try {
         const { rows: connections } = await pgPool.query('SELECT * FROM explorer_connections');
         if (!connections.length) return console.log("[CRON] No connections found. Aborting.");
-        const todayISO = new Date().toISOString(); const todayStr = todayISO.slice(0, 10).replace(/-/g, ''); const targetDate = todayISO.slice(0, 10); 
+        const todayISO = new Date().toISOString(); const todayStr = todayISO.slice(0, 10).replace(/-/g, ''); const targetDate = todayISO.slice(0, 10);
         for (const conn of connections) {
-            if (conn.type === 'airflow') continue;
-            
-            console.log(`\n[CRON] Scanning Connection: ${conn.name} (${conn.type})`);
-            const srHost = conn.host; const srPort = conn.type === 'starrocks' ? conn.port : 9030;
-            const srUser = conn.type === 'starrocks' ? conn.username : (conn.sr_username || 'root');
-            const srPassword = conn.type === 'starrocks' ? decrypt(conn.password) : (decrypt(conn.sr_password) || '');
-            let mysqlConn;
             try {
-                mysqlConn = await mysql.createConnection({ host: srHost, port: srPort, user: srUser, password: srPassword });
-                await mysqlConn.query('SET new_planner_optimize_timeout = 300000;');
-                await mysqlConn.query('SET query_timeout = 300;');
+                if (conn.type === 'airflow') continue;
 
-                if (conn.type === 'hive') await mysqlConn.query('SET CATALOG hudi_catalog;');
-                const [dbRows] = await mysqlConn.query('SHOW DATABASES'); const dbs = dbRows.map(r => Object.values(r)[0]).filter(d => d !== 'information_schema' && d !== 'sys');
-                let totalTablesProfiled = 0;
-                for (const db of dbs) {
-                    const [tableRows] = await mysqlConn.query(`SHOW TABLES FROM \`${db}\``); const tables = tableRows.map(r => Object.values(r)[0]);
-                    for (const table of tables) {
-                        try {
-                            let total = 0, today = 0, previous = 0, isHudi = false;
-                            try { const [schemaCols] = await mysqlConn.query(`DESCRIBE \`${db}\`.\`${table}\``); isHudi = schemaCols.some(c => c.Field === '_hoodie_record_key'); } catch(e) { console.warn(`[Cron] Hudi check failed for ${db}.${table}:`, e.message); }
-                            if (isHudi) {
-                                const [totalResult] = await mysqlConn.query(`SELECT COUNT(DISTINCT \`_hoodie_record_key\`) as count FROM \`${db}\`.\`${table}\``);
-                                const [todayResult] = await mysqlConn.query(`SELECT COUNT(DISTINCT \`_hoodie_record_key\`) as count FROM \`${db}\`.\`${table}\` WHERE \`_hoodie_commit_time\` LIKE ?`, [\`${todayStr}%\`]);
-                                total = Number(totalResult[0].count); today = Number(todayResult[0].count); previous = total - today;
-                            } else {
-                                const [totalResult] = await mysqlConn.query(`SELECT COUNT(*) as count FROM \`${db}\`.\`${table}\``);
-                                total = Number(totalResult[0].count); today = null; previous = null;
-                            }
-                            await pgPool.query(`INSERT INTO explorer_observability (connection_id, db_name, table_name, total_count, today_count, previous_count, target_date) VALUES ($1, $2, $3, $4, $5, $6, $7)`, [conn.id, db, table, total, today, previous, targetDate]);
-                            totalTablesProfiled++;
-                        } catch (tableErr) { console.error(`\n[CRON] Error profiling ${db}.${table}:`, tableErr.message); }
+                console.log(`\n[CRON] Scanning Connection: ${conn.name} (${conn.type})`);
+                const srHost = conn.host; const srPort = conn.type === 'starrocks' ? conn.port : 9030;
+                const srUser = conn.type === 'starrocks' ? conn.username : (conn.sr_username || 'root');
+                const srPassword = conn.type === 'starrocks' ? decrypt(conn.password) : (decrypt(conn.sr_password) || '');
+                let mysqlConn;
+                try {
+                    mysqlConn = await mysql.createConnection({ host: srHost, port: srPort, user: srUser, password: srPassword });
+                    await mysqlConn.query('SET new_planner_optimize_timeout = 300000;');
+                    await mysqlConn.query('SET query_timeout = 300;');
+
+                    if (conn.type === 'hive') await mysqlConn.query('SET CATALOG hudi_catalog;');
+                    const [dbRows] = await mysqlConn.query('SHOW DATABASES'); const dbs = dbRows.map(r => Object.values(r)[0]).filter(d => d !== 'information_schema' && d !== 'sys');
+                    let totalTablesProfiled = 0;
+                    for (const db of dbs) {
+                        const [tableRows] = await mysqlConn.query(`SHOW TABLES FROM \`${db}\``); const tables = tableRows.map(r => Object.values(r)[0]);
+                        for (const table of tables) {
+                            try {
+                                let total = 0, today = 0, previous = 0, isHudi = false;
+                                try { const [schemaCols] = await mysqlConn.query(`DESCRIBE \`${db}\`.\`${table}\``); isHudi = schemaCols.some(c => c.Field === '_hoodie_record_key'); } catch(e) { console.warn(`[Cron] Hudi check failed for ${db}.${table}:`, e.message); }
+                                if (isHudi) {
+                                    const [totalResult] = await mysqlConn.query(`SELECT COUNT(DISTINCT \`_hoodie_record_key\`) as count FROM \`${db}\`.\`${table}\``);
+                                    const [todayResult] = await mysqlConn.query(`SELECT COUNT(DISTINCT \`_hoodie_record_key\`) as count FROM \`${db}\`.\`${table}\` WHERE \`_hoodie_commit_time\` LIKE ?`, [`${todayStr}%`]);
+                                    total = Number(totalResult[0].count); today = Number(todayResult[0].count); previous = total - today;
+                                } else {
+                                    const [totalResult] = await mysqlConn.query(`SELECT COUNT(*) as count FROM \`${db}\`.\`${table}\``);
+                                    total = Number(totalResult[0].count); today = null; previous = null;
+                                }
+                                await pgPool.query(
+                                    `INSERT INTO explorer_observability (connection_id, db_name, table_name, total_count, today_count, previous_count, target_date)
+                                     VALUES ($1, $2, $3, $4, $5, $6, $7)
+                                     ON CONFLICT (connection_id, db_name, table_name, target_date)
+                                     DO UPDATE SET total_count = EXCLUDED.total_count, today_count = EXCLUDED.today_count,
+                                                   previous_count = EXCLUDED.previous_count, measured_at = CURRENT_TIMESTAMP`,
+                                    [conn.id, db, table, total, today, previous, targetDate]);
+                                totalTablesProfiled++;
+                            } catch (tableErr) { console.error(`\n[CRON] Error profiling ${db}.${table}:`, tableErr.message); }
+                        }
                     }
-                }
-                console.log(`\n[CRON] ✅ Completed ${conn.name}: Profiled ${totalTablesProfiled} tables.`);
-            } catch (connErr) { console.error(`\n[CRON] ❌ Failed to connect: ${connErr.message}`); } finally { if (mysqlConn) await mysqlConn.end(); }
+                    console.log(`\n[CRON] ✅ Completed ${conn.name}: Profiled ${totalTablesProfiled} tables.`);
+                } catch (connErr) { console.error(`\n[CRON] ❌ Failed to connect: ${connErr.message}`); } finally { if (mysqlConn) await mysqlConn.end(); }
+            } catch (outerErr) { console.error(`\n[CRON] Unexpected error processing connection ${conn.name}:`, outerErr.message); }
         }
     } catch (err) { console.error("\n[CRON] Global Scan Fatal Error:", err); }
 }
@@ -2314,6 +2333,8 @@ cat << 'EOF' > "$APP_DIR/backend/middleware/rbac.js"
  * Role-Based Access Control middleware.
  * Usage:  router.post('/route', requireRole('admin'), handler)
  */
+
+/** Returns Express middleware that rejects requests whose user role is not in the provided list. */
 const requireRole = (...roles) => (req, res, next) => {
     if (!req.user) {
         return res.status(401).json({ error: 'Authentication required.' });
@@ -2356,6 +2377,8 @@ function validateConnection(body) {
         return `Connection type must be one of: ${CONNECTION_TYPES.join(', ')}.`;
     if (!isNonEmptyString(host, 255))
         return 'Host is required (max 255 chars).';
+    if (/[;&|`$<>(){}\\'"!]/.test(host))
+        return 'Host contains invalid characters.';
     if (!isPositiveInt(port) || Number(port) > 65535)
         return 'Port must be a number between 1 and 65535.';
     return null; // valid
@@ -2570,6 +2593,11 @@ router.patch('/users/:id/role', async (req, res) => {
             'UPDATE explorer_users SET role = $1 WHERE id = $2', [role, targetId]
         );
         if (!rowCount) return res.status(404).json({ error: 'User not found.' });
+
+        // Fire-and-forget audit log — never blocks the response
+        pgPool.query('CREATE TABLE IF NOT EXISTS explorer_audit_log (id SERIAL PRIMARY KEY, actor TEXT, action TEXT, target TEXT, detail TEXT, created_at TIMESTAMPTZ DEFAULT NOW())').catch(() => {});
+        pgPool.query('INSERT INTO explorer_audit_log (actor, action, target, detail) VALUES ($1,$2,$3,$4)', [req.user.username, 'role_change', String(targetId), JSON.stringify({ role })]).catch(() => {});
+
         res.json({ success: true });
     } catch (e) {
         console.error('[Admin Role Change Error]:', e.message);
@@ -2591,13 +2619,15 @@ router.delete('/users/:id', async (req, res) => {
             return res.status(400).json({ error: 'You cannot delete your own account.' });
         }
 
-        const { rows: targetRows } = await pgPool.query(
-            'SELECT username FROM explorer_users WHERE id = $1', [targetId]
-        );
         const { rowCount } = await pgPool.query(
             'DELETE FROM explorer_users WHERE id = $1', [targetId]
         );
         if (!rowCount) return res.status(404).json({ error: 'User not found.' });
+
+        // Fire-and-forget audit log — never blocks the response
+        pgPool.query('CREATE TABLE IF NOT EXISTS explorer_audit_log (id SERIAL PRIMARY KEY, actor TEXT, action TEXT, target TEXT, detail TEXT, created_at TIMESTAMPTZ DEFAULT NOW())').catch(() => {});
+        pgPool.query('INSERT INTO explorer_audit_log (actor, action, target, detail) VALUES ($1,$2,$3,$4)', [req.user.username, 'user_delete', String(targetId), JSON.stringify({})]).catch(() => {});
+
         res.json({ success: true });
     } catch (e) {
         console.error('[Admin Delete User Error]:', e.message);
@@ -2951,11 +2981,21 @@ EOF
 
 cat << 'EOF' > $APP_DIR/backend/routes/metadata.js
 const express = require('express'); const router = express.Router(); const mysql = require('mysql2/promise'); const { pgPool } = require('../db'); const { getConnConfig } = require('../utils/crypto');
-const rateLimit = require('express-rate-limit');
 const { requireRole } = require('../middleware/rbac');
 const { isIdentifier, validateConnectionId, validateTableRef } = require('../middleware/validate');
 const { requireConnectionAccess } = require('../middleware/access');
+const rateLimit = require('express-rate-limit');
 const isValidIdentifier = isIdentifier; // backward compat alias
+
+// LLM rate limiter — 50 requests/hour per authenticated user (falls back to IP)
+const llmLimiter = rateLimit({
+    windowMs: 60 * 60 * 1000,
+    max: 50,
+    keyGenerator: (req) => req.user?.username || req.ip,
+    message: { error: 'LLM generation rate limit exceeded. Please try again later.' },
+    standardHeaders: true,
+    legacyHeaders: false,
+});
 const truncateSampleData = (rows, maxStrLen = 100) => rows.map(row => { const cleanRow = {}; for (let [key, val] of Object.entries(row)) { if (val === null || val === undefined) { cleanRow[key] = val; } else if (typeof val === 'object') { const strVal = JSON.stringify(val); cleanRow[key] = strVal.length > maxStrLen ? strVal.substring(0, maxStrLen) + '... [truncated]' : strVal; } else if (typeof val === 'string') { cleanRow[key] = val.length > maxStrLen ? val.substring(0, maxStrLen) + '... [truncated]' : val; } else { cleanRow[key] = val; } } return cleanRow; });
 
 router.post('/retrieve', requireConnectionAccess('connection_id'), async (req, res) => {
@@ -2982,7 +3022,7 @@ const ALLOWED_LLM_MODELS = new Set([
     'meta-llama/llama-3.1-70b-instruct', 'meta-llama/llama-3.1-8b-instruct',
 ]);
 
-router.post('/generate', requireRole('admin'), async (req, res) => {
+router.post('/generate', requireRole('admin'), llmLimiter, async (req, res) => {
     try {
         const { connection_id, db_name, table_name } = req.body;
         const schema = Array.isArray(req.body.schema) ? req.body.schema.slice(0, 200) : [];
@@ -3072,7 +3112,7 @@ router.post('/calculate', requireConnectionAccess('connection_id'), async (req, 
             if (conn.type === 'hive') await connection.query('SET CATALOG hudi_catalog;');
             let isHudi = false; try { const [schemaCols] = await connection.query(`DESCRIBE \`${db_name}\`.\`${table_name}\``); isHudi = schemaCols.some(c => c.Field === '_hoodie_record_key'); } catch(e) { console.warn('[Observability] Hudi check failed:', e.message); }
             if (isHudi) {
-                const [totalResult] = await connection.query(`SELECT COUNT(DISTINCT \`_hoodie_record_key\`) as count FROM \`${db_name}\`.\`${table_name}\``); const [todayResult] = await connection.query(`SELECT COUNT(DISTINCT \`_hoodie_record_key\`) as count FROM \`${db_name}\`.\`${table_name}\` WHERE \`_hoodie_commit_time\` LIKE ?`, [\`${todayStr}%\`]); total = Number(totalResult[0].count); today = Number(todayResult[0].count); previous = total - today; typeStr = 'starrocks_hudi_fast';
+                const [totalResult] = await connection.query(`SELECT COUNT(DISTINCT \`_hoodie_record_key\`) as count FROM \`${db_name}\`.\`${table_name}\``); const [todayResult] = await connection.query(`SELECT COUNT(DISTINCT \`_hoodie_record_key\`) as count FROM \`${db_name}\`.\`${table_name}\` WHERE \`_hoodie_commit_time\` LIKE ?`, [`${todayStr}%`]); total = Number(totalResult[0].count); today = Number(todayResult[0].count); previous = total - today; typeStr = 'starrocks_hudi_fast';
             } else { const [totalResult] = await connection.query(`SELECT COUNT(*) as count FROM \`${db_name}\`.\`${table_name}\``); total = Number(totalResult[0].count); today = null; previous = null; }
         } finally { await connection.end(); }
         await pgPool.query(
@@ -3634,6 +3674,8 @@ const mysql = require('mysql2/promise');
 const { Client } = require('pg');
 const { decrypt } = require('../utils/crypto');
 
+const isValidIdentifier = (name) => typeof name === 'string' && /^[a-zA-Z0-9_\-]+$/.test(name);
+
 const SYSTEM_DBS = ['information_schema', 'sys', '_statistics_', 'mysql',
                     'performance_schema', 'default', 'hudi_metadata'];
 const TABLE_EXCLUDE_RE = /(_ro|_rt|_temp|_tmp|_bak|_backup)$|^[_\.]/i;
@@ -3772,11 +3814,11 @@ router.get('/stats', async (req, res) => {
 // ── FIX #16: paginated global search ─────────────────────────────────────────
 router.post('/global-search', async (req, res) => {
     try {
-        const { query, page = 1, limit = 20 } = req.body;
+        const { query, page = 1, limit = 100 } = req.body;
         if (!query || query.trim().length < 2) return res.json({ results: [], total: 0, page: 1, pages: 0 });
 
         const safePage  = Math.max(1, parseInt(page)  || 1);
-        const safeLimit = Math.min(50, Math.max(1, parseInt(limit) || 20));
+        const safeLimit = Math.min(200, Math.max(1, parseInt(limit) || 100));
 
         const { rows: connections } = req.user.role === 'admin'
             ? await pgPool.query('SELECT * FROM explorer_connections')
@@ -3871,7 +3913,9 @@ router.post('/global-search', async (req, res) => {
             }
         }));
 
-        allResults.sort((a, b) => a.type.localeCompare(b.type));
+        // Sort: database first, then table, then dag — so DB/table results are never buried behind DAGs
+        const TYPE_PRIORITY = { database: 0, table: 1, dag: 2 };
+        allResults.sort((a, b) => (TYPE_PRIORITY[a.type] ?? 3) - (TYPE_PRIORITY[b.type] ?? 3));
         const total   = allResults.length;
         const pages   = Math.ceil(total / safeLimit);
         const offset  = (safePage - 1) * safeLimit;
@@ -4421,7 +4465,8 @@ app.post('/api/auth/signup', async (req, res) => {
     try {
         const { username, password } = req.body;
         if (!username || !password)       return res.status(400).json({ error: 'Username and password required.' });
-        if (password.length < 8)          return res.status(400).json({ error: 'Password must be at least 8 characters.' });
+        if (password.length < 12 || !/[A-Z]/.test(password) || !/[a-z]/.test(password) || !/[0-9]/.test(password) || !/[^A-Za-z0-9]/.test(password))
+            return res.status(400).json({ error: 'Password must be at least 12 characters and contain uppercase, lowercase, a number, and a special character.' });
         if (!/^[a-zA-Z0-9_\-\.]+$/.test(username)) return res.status(400).json({ error: 'Username may only contain letters, numbers, _ - .' });
 
         const { rows } = await pgPool.query('SELECT id FROM explorer_users WHERE username = $1', [username]);
@@ -4450,9 +4495,15 @@ app.use('/api/observability/webhook', (req, res, next) => {
     if (isNaN(age) || age > 5 * 60 * 1000) {
         return res.status(401).json({ error: 'Webhook timestamp expired or invalid.' });
     }
+    // Require WEBHOOK_SECRET to be configured — fail hard if missing
+    if (!process.env.WEBHOOK_SECRET) {
+        return res.status(500).json({ error: 'Webhook secret is not configured.' });
+    }
+
+    // Compute HMAC over "<timestamp>.<raw_body>"
     const rawBody = req.rawBody?.toString() || '';
     const expected = crypto
-        .createHmac('sha256', process.env.WEBHOOK_SECRET || '')
+        .createHmac('sha256', process.env.WEBHOOK_SECRET)
         .update(`${ts}.${rawBody}`)
         .digest('hex');
     let valid = false;
@@ -4484,8 +4535,7 @@ const enforceAuth = (req, res, next) => {
                 next();
             })
             .catch(() => {
-                req.user = user; // fallback to token role if DB unreachable
-                next();
+                return res.status(503).json({ error: 'Service temporarily unavailable. Please retry.' });
             });
     });
 };
@@ -4501,7 +4551,8 @@ app.post('/api/auth/change-password', enforceAuth, async (req, res) => {
     try {
         const { current_password, new_password } = req.body;
         if (!current_password || !new_password) return res.status(400).json({ error: 'current_password and new_password are required.' });
-        if (new_password.length < 8)             return res.status(400).json({ error: 'New password must be at least 8 characters.' });
+        if (new_password.length < 12 || !/[A-Z]/.test(new_password) || !/[a-z]/.test(new_password) || !/[0-9]/.test(new_password) || !/[^A-Za-z0-9]/.test(new_password))
+            return res.status(400).json({ error: 'New password must be at least 12 characters and contain uppercase, lowercase, a number, and a special character.' });
 
         const { rows } = await pgPool.query('SELECT * FROM explorer_users WHERE username = $1', [req.user.username]);
         if (!rows.length) return res.status(404).json({ error: 'User not found.' });
@@ -4866,6 +4917,7 @@ export default function Home() {
 
     const [searchQuery, setSearchQuery] = useState('');
     const [searchResults, setSearchResults] = useState([]);
+    const [searchTotal, setSearchTotal] = useState(0);
     const [showSearch, setShowSearch] = useState(false);
     const [isSearching, setIsSearching] = useState(false);
 
@@ -4880,14 +4932,15 @@ export default function Home() {
         const delayDebounceFn = setTimeout(() => {
             if (searchQuery.length >= 2) {
                 setIsSearching(true);
-                api.post(`${API}/home/global-search`, { query: searchQuery })
-                     .then(res => setSearchResults(res.data))
+                api.post(`${API}/home/global-search`, { query: searchQuery, limit: 100 })
+                     .then(res => { setSearchResults(res.data.results || []); setSearchTotal(res.data.total || 0); })
                      .catch(err => console.error(err))
                      .finally(() => setIsSearching(false));
             } else {
                 setSearchResults([]);
+                setSearchTotal(0);
             }
-        }, 400); 
+        }, 400);
         return () => clearTimeout(delayDebounceFn);
     }, [searchQuery]);
 
@@ -4954,7 +5007,7 @@ export default function Home() {
                                     <div className="bg-gray-50/95 backdrop-blur-sm border-b border-gray-100 px-5 py-3 flex justify-between items-center sticky top-0 z-10 shrink-0">
                                         <span className="text-[10px] font-extrabold text-gray-500 uppercase tracking-widest flex items-center"><i className="fas fa-list-ul mr-2"></i>Search Results</span>
                                         {searchResults.length > 0 ? (
-                                            <span className="bg-indigo-100 text-indigo-700 text-[11px] font-black px-2.5 py-1 rounded border border-indigo-200 shadow-sm">{searchResults.length} Matches Found</span>
+                                            <span className="bg-indigo-100 text-indigo-700 text-[11px] font-black px-2.5 py-1 rounded border border-indigo-200 shadow-sm">{searchTotal} Matches Found</span>
                                         ) : (
                                             <span className="bg-gray-200 text-gray-500 text-[11px] font-black px-2.5 py-1 rounded border border-gray-300 shadow-sm">0 Matches</span>
                                         )}

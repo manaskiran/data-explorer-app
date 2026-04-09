@@ -2,26 +2,20 @@ const express = require('express'); const router = express.Router(); const mysql
 const { maskDataPreview } = require('../utils/masking');
 const { requireConnectionAccess } = require('../middleware/access');
 const globalHiveCache = {};
-const HIVE_CACHE_TTL_MS  = 5 * 60 * 1000; // 5 minutes TTL per entry
-const HIVE_CACHE_MAX_KEYS = 500;           // max schema entries per connection (memory cap)
-
-// Purge expired cache entries every 10 minutes
+const HIVE_CACHE_TTL_MS  = 5 * 60 * 1000;
+const HIVE_CACHE_MAX_KEYS = 500;
 setInterval(() => {
     const now = Date.now();
     for (const connId of Object.keys(globalHiveCache)) {
         const bucket = globalHiveCache[connId];
         for (const key of Object.keys(bucket)) {
             if (key.endsWith('__ts') && now - bucket[key] > HIVE_CACHE_TTL_MS) {
-                const base = key.slice(0, -4);
-                delete bucket[base];
-                delete bucket[key];
+                const base = key.slice(0, -4); delete bucket[base]; delete bucket[key];
             }
         }
         if (Object.keys(bucket).length === 0) delete globalHiveCache[connId];
     }
 }, 10 * 60 * 1000).unref();
-
-/** Evict oldest half of bucket entries when cap is hit */
 function hiveCacheEvict(bucket) {
     const tsKeys = Object.keys(bucket).filter(k => k.endsWith('__ts'));
     if (tsKeys.length < HIVE_CACHE_MAX_KEYS) return;
@@ -31,10 +25,9 @@ function hiveCacheEvict(bucket) {
 }
 const isValidIdentifier = (name) => typeof name === 'string' && /^[a-zA-Z0-9_\-]+$/.test(name);
 
-const HIVE_CONNECT_TIMEOUT_MS = 20000; // 20 s — abort if Hive server doesn't respond
-const HIVE_QUERY_TIMEOUT_MS   = 30000; // 30 s per individual query
+const HIVE_CONNECT_TIMEOUT_MS = 20000;
+const HIVE_QUERY_TIMEOUT_MS   = 30000;
 
-/** Race any promise against a hard deadline */
 const withTimeout = (promise, ms, label) =>
     Promise.race([
         promise,
@@ -52,14 +45,13 @@ async function setupHiveClient(conn) {
     let client = new hive.HiveClient(TCLIService, TCLIService_types);
     client.on('error', () => {});
 
-    // Attempt PlainTCP auth first, fall back to NoSASL — both under a strict connect timeout
     try {
         await withTimeout(
             client.connect({ host, port }, new hive.connections.TcpConnection(), new hive.auth.PlainTcpAuthentication({ username: authUser, password: authPass })),
             HIVE_CONNECT_TIMEOUT_MS, 'Hive PlainTCP connect'
         );
     } catch (e) {
-        if (e.message.startsWith('HIVE_TIMEOUT')) throw e; // don't retry on timeout
+        if (e.message.startsWith('HIVE_TIMEOUT')) throw e;
         client = new hive.HiveClient(TCLIService, TCLIService_types);
         client.on('error', () => {});
         await withTimeout(
@@ -94,7 +86,7 @@ async function getSrConnection(host, port, user, password) {
 }
 
 router.post('/explore/fetch', requireConnectionAccess('id'), async (req, res) => {
-    req.setTimeout(60000); // 60 s hard cap — prevents frontend from hanging forever
+    req.setTimeout(60000);
     try {
         const { rows } = await pgPool.query('SELECT * FROM explorer_connections WHERE id = $1', [req.body.id]); if (!rows.length) return res.status(404).json({ error: 'Connection not found' });
         const conn = rows[0]; conn.password = decrypt(conn.password); conn.sr_password = decrypt(conn.sr_password);
@@ -159,11 +151,10 @@ router.post('/search/fetch', requireConnectionAccess('id'), async (req, res) => 
     } catch (e) { console.error("[Search Fetch Error]:", e); res.status(500).json({ error: "Failed to perform global search." }); }
 });
 
-const EXPORT_ROW_LIMIT  = 50000; // max metadata rows per export
-const EXPORT_TIMEOUT_MS = 120000; // 2 minutes — enough for any schema dictionary
-
 router.post('/export/fetch', requireConnectionAccess('id'), async (req, res) => {
-    req.setTimeout(EXPORT_TIMEOUT_MS);
+    const EXPORT_ROW_LIMIT  = 50000;
+    const EXPORT_TIMEOUT_MS = 120000;
+    req.setTimeout(EXPORT_TIMEOUT_MS); 
     try {
         const { rows } = await pgPool.query('SELECT * FROM explorer_connections WHERE id = $1', [req.body.id]); if (!rows.length) return res.status(404).json({ error: 'Connection not found' });
         const conn = rows[0]; conn.password = decrypt(conn.password); conn.sr_password = decrypt(conn.sr_password);
@@ -171,20 +162,20 @@ router.post('/export/fetch', requireConnectionAccess('id'), async (req, res) => 
         const workbook = new excel.Workbook(); const worksheet = workbook.addWorksheet(`${req.body.db} Dictionary`);
         worksheet.columns = [ { header: 'Database', key: 'db', width: 20 }, { header: 'Table Name', key: 'table', width: 35 }, { header: 'Column Name', key: 'column', width: 35 }, { header: 'Data Type', key: 'type', width: 20 }, { header: 'Comment', key: 'comment', width: 40 } ];
         worksheet.getRow(1).font = { bold: true, color: { argb: 'FFFFFFFF' } }; worksheet.getRow(1).fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF4F81BD' } };
-
+        
         const { rows: metaRows } = await pgPool.query('SELECT table_name, column_comments FROM explorer_table_metadata WHERE connection_id = $1 AND db_name = $2', [conn.id, req.body.db]);
         const dbMeta = {}; metaRows.forEach(r => { dbMeta[r.table_name] = typeof r.column_comments === 'string' ? JSON.parse(r.column_comments) : (r.column_comments || {}); });
 
         if (conn.type === 'starrocks') {
             const connection = await getSrConnection(conn.host, conn.port, conn.username, conn.password);
             try {
-                // LIMIT caps export to prevent unbounded worker tie-up
                 const [cols] = await connection.query(`SELECT TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME, DATA_TYPE, COLUMN_COMMENT FROM information_schema.columns WHERE TABLE_SCHEMA = ? ORDER BY TABLE_NAME, ORDINAL_POSITION LIMIT ${EXPORT_ROW_LIMIT}`, [req.body.db]);
                 cols.forEach(c => { const overrideComment = dbMeta[c.TABLE_NAME]?.[c.COLUMN_NAME]; worksheet.addRow({ db: c.TABLE_SCHEMA, table: c.TABLE_NAME, column: c.COLUMN_NAME, type: c.DATA_TYPE, comment: overrideComment || c.COLUMN_COMMENT || '' }); });
             } finally { await connection.end(); }
         } else {
             let setup = await setupHiveClient(conn);
             try {
+                // isValidIdentifier already enforced above; use backtick quoting for Hive identifier safety
                 const safeDb = req.body.db.replace(/`/g, '');
                 const allCols = await Promise.race([ setup.executeQuery(`SELECT table_name, column_name, data_type, comment FROM information_schema.columns WHERE table_schema = \`${safeDb}\` LIMIT ${EXPORT_ROW_LIMIT}`), new Promise((_, r) => setTimeout(() => r(new Error("FAST_TIMEOUT")), 15000)) ]);
                 if (allCols && allCols.length > 0) { allCols.forEach(r => { const override = dbMeta[Object.values(r)[0]]?.[Object.values(r)[1]]; worksheet.addRow({ db: req.body.db, table: Object.values(r)[0], column: Object.values(r)[1], type: Object.values(r)[2] || '', comment: override || Object.values(r)[3] || '' }); }); }
@@ -252,6 +243,7 @@ router.post('/explore/query', requireConnectionAccess('connection_id'), async (r
 
         try {
             if (conn.type === 'hive') await connection.query('SET CATALOG hudi_catalog;');
+            if (db_name && !isValidIdentifier(db_name)) { await connection.end(); return res.status(400).json({ error: 'Invalid database name' }); }
             if (db_name) await connection.query(`USE \`${db_name}\``);
             const [dataRows] = await connection.query(execQuery);
             results = dataRows;

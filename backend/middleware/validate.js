@@ -24,6 +24,8 @@ function validateConnection(body) {
         return `Connection type must be one of: ${CONNECTION_TYPES.join(', ')}.`;
     if (!isNonEmptyString(host, 255))
         return 'Host is required (max 255 chars).';
+    if (/[;&|`$<>(){}\\'"!]/.test(host))
+        return 'Host contains invalid characters.';
     if (!isPositiveInt(port) || Number(port) > 65535)
         return 'Port must be a number between 1 and 65535.';
     return null; // valid

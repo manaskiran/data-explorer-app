@@ -39,19 +39,17 @@ const getSrConn = async (host, port, user, password) => {
     return c;
 };
 
-// POST /api/lineage/real-lineage
 router.post('/real-lineage', async (req, res) => {
     req.setTimeout(120000);
     try {
         const { hive_connection_id, sr_connection_id } = req.body;
         const nodes = [];
 
-        // Hive: route through StarRocks MySQL with hudi_catalog (direct Hive TCP times out)
         if (hive_connection_id) {
             const { rows } = await pgPool.query('SELECT * FROM explorer_connections WHERE id = $1', [hive_connection_id]);
             if (rows.length) {
                 const conn = rows[0];
-                const cfg = getConnConfig(conn); // port=9030, sr_username, sr_password decrypted
+                const cfg = getConnConfig(conn);
                 const db = await getSrConn(conn.host, cfg.port, cfg.user, cfg.password);
                 try {
                     await db.query('SET CATALOG hudi_catalog;');
@@ -72,7 +70,6 @@ router.post('/real-lineage', async (req, res) => {
             }
         }
 
-        // StarRocks: direct MySQL connection
         if (sr_connection_id) {
             const { rows } = await pgPool.query('SELECT * FROM explorer_connections WHERE id = $1', [sr_connection_id]);
             if (rows.length) {
@@ -97,10 +94,8 @@ router.post('/real-lineage', async (req, res) => {
             }
         }
 
-        // Build edges — connect consecutive layers within each application
         const byApp = {};
         nodes.forEach(n => { if (!byApp[n.application]) byApp[n.application] = []; byApp[n.application].push(n); });
-
         const edges = [];
         const edgeSet = new Set();
         const normalize = (name) => name.replace(/^hv_|^sr_|^hvc_/i, '').replace(/_curated$|_service$|_raw$/, '').toLowerCase();
@@ -110,11 +105,9 @@ router.post('/real-lineage', async (req, res) => {
             LAYER_ORDER.forEach(l => { byLayer[l] = []; });
             appNodes.forEach(n => { if (!byLayer[n.layer]) byLayer[n.layer] = []; byLayer[n.layer].push(n); });
             const presentLayers = LAYER_ORDER.filter(l => byLayer[l]?.length > 0);
-
             for (let i = 0; i < presentLayers.length - 1; i++) {
                 const srcNodes = byLayer[presentLayers[i]];
                 const tgtNodes = byLayer[presentLayers[i + 1]];
-
                 if (srcNodes.length <= 2) {
                     for (const src of srcNodes) {
                         for (const tgt of tgtNodes) {
@@ -151,16 +144,13 @@ router.post('/real-lineage', async (req, res) => {
     }
 });
 
-// POST /api/lineage/node/columns — fetch columns for a single node
 router.post('/node/columns', async (req, res) => {
     try {
         const { connection_id, db_name, table_name, source } = req.body;
         if (!isValidIdentifier(db_name) || !isValidIdentifier(table_name)) return res.status(400).json({ error: 'Invalid identifier' });
-
         const { rows } = await pgPool.query('SELECT * FROM explorer_connections WHERE id = $1', [connection_id]);
         if (!rows.length) return res.status(404).json({ error: 'Connection not found' });
         const conn = rows[0];
-
         if (source === 'starrocks') {
             const db = await getSrConn(conn.host, conn.port, conn.username, decrypt(conn.password));
             try {
@@ -168,17 +158,12 @@ router.post('/node/columns', async (req, res) => {
                 res.json(cols.map(c => ({ name: c.Field, type: c.Type, key: c.Key === 'true' })));
             } finally { await db.end(); }
         } else {
-            // Hive: use StarRocks MySQL with hudi_catalog
             const cfg = getConnConfig(conn);
             const db = await getSrConn(conn.host, cfg.port, cfg.user, cfg.password);
             try {
                 await db.query('SET CATALOG hudi_catalog;');
                 const [cols] = await db.query(`DESCRIBE \`${db_name}\`.\`${table_name}\``);
-                res.json(cols.map(c => ({
-                    name: c.Field || c.col_name || '',
-                    type: c.Type || c.data_type || '',
-                    comment: c.Comment || ''
-                })).filter(c => c.name && !c.name.startsWith('#') && !c.name.startsWith('_hoodie')));
+                res.json(cols.map(c => ({ name: c.Field || c.col_name || '', type: c.Type || c.data_type || '', comment: c.Comment || '' })).filter(c => c.name && !c.name.startsWith('#') && !c.name.startsWith('_hoodie')));
             } finally { await db.end(); }
         }
     } catch (e) {

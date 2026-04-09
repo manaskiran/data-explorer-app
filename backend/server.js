@@ -45,7 +45,6 @@ app.use(helmet({
     contentSecurityPolicy: {
         directives: {
             defaultSrc:  ["'self'"],
-            // 'unsafe-inline' removed from scriptSrc — production Vite build emits only src-referenced modules
             scriptSrc:   ["'self'", "cdnjs.cloudflare.com"],
             styleSrc:    ["'self'", "'unsafe-inline'", "cdnjs.cloudflare.com", "fonts.googleapis.com"],
             fontSrc:     ["'self'", "cdnjs.cloudflare.com", "fonts.gstatic.com"],
@@ -147,7 +146,6 @@ app.use('/api/datawizz/build', rateLimit({
 app.use(cookieParser());
 
 // ─── Body parsing ─────────────────────────────────────────────────────────────
-// `verify` stores the raw Buffer on req so the webhook HMAC can hash it
 app.use(express.json({
     limit: '5mb',
     verify: (req, _res, buf) => { req.rawBody = buf; },
@@ -230,7 +228,7 @@ app.post('/api/auth/login', async (req, res) => {
         if (!username || !password) return res.status(400).json({ error: 'Username and password required.' });
 
         const { rows } = await pgPool.query('SELECT * FROM explorer_users WHERE username = $1', [username]);
-        // Always run bcrypt.compare — even for missing users — to prevent timing-based username enumeration.
+        // Always run bcrypt — even for missing users — to prevent timing-based username enumeration.
         const DUMMY_HASH = '$2b$12$invalidhashpaddingtomatchbcryptlengthXXXXXXXXXXXXXXXXXX';
         const hashToCheck = rows.length > 0 ? rows[0].password : DUMMY_HASH;
         const passwordMatch = await bcrypt.compare(password, hashToCheck);
@@ -251,7 +249,8 @@ app.post('/api/auth/signup', async (req, res) => {
     try {
         const { username, password } = req.body;
         if (!username || !password)       return res.status(400).json({ error: 'Username and password required.' });
-        if (password.length < 8)          return res.status(400).json({ error: 'Password must be at least 8 characters.' });
+        if (password.length < 12 || !/[A-Z]/.test(password) || !/[a-z]/.test(password) || !/[0-9]/.test(password) || !/[^A-Za-z0-9]/.test(password))
+            return res.status(400).json({ error: 'Password must be at least 12 characters and contain uppercase, lowercase, a number, and a special character.' });
         if (!/^[a-zA-Z0-9_\-\.]+$/.test(username)) return res.status(400).json({ error: 'Username may only contain letters, numbers, _ - .' });
 
         const { rows } = await pgPool.query('SELECT id FROM explorer_users WHERE username = $1', [username]);
@@ -271,34 +270,32 @@ app.post('/api/auth/signup', async (req, res) => {
 
 // ─── Webhook (HMAC-SHA256 + timestamp replay protection) ─────────────────────
 app.use('/api/observability/webhook', (req, res, next) => {
-    const sig = req.headers['x-webhook-signature'];  // HMAC-SHA256 hex digest
-    const ts  = req.headers['x-webhook-timestamp'];  // Unix ms timestamp
-
+    const sig = req.headers['x-webhook-signature'];
+    const ts  = req.headers['x-webhook-timestamp'];
     if (!sig || !ts) {
         return res.status(401).json({ error: 'Missing X-Webhook-Signature or X-Webhook-Timestamp header.' });
     }
-
-    // Reject requests older than 5 minutes to block replay attacks
     const age = Math.abs(Date.now() - Number(ts));
     if (isNaN(age) || age > 5 * 60 * 1000) {
         return res.status(401).json({ error: 'Webhook timestamp expired or invalid.' });
+    }
+    // Require WEBHOOK_SECRET to be configured — fail hard if missing
+    if (!process.env.WEBHOOK_SECRET) {
+        return res.status(500).json({ error: 'Webhook secret is not configured.' });
     }
 
     // Compute HMAC over "<timestamp>.<raw_body>"
     const rawBody = req.rawBody?.toString() || '';
     const expected = crypto
-        .createHmac('sha256', process.env.WEBHOOK_SECRET || '')
+        .createHmac('sha256', process.env.WEBHOOK_SECRET)
         .update(`${ts}.${rawBody}`)
         .digest('hex');
-
-    // Constant-time comparison to prevent timing oracle
     let valid = false;
     try {
         const sigBuf = Buffer.from(sig,      'hex');
         const expBuf = Buffer.from(expected, 'hex');
         valid = sigBuf.length === expBuf.length && crypto.timingSafeEqual(sigBuf, expBuf);
     } catch (_) { valid = false; }
-
     if (!valid) {
         return res.status(401).json({ error: 'Invalid webhook signature.' });
     }
@@ -322,8 +319,7 @@ const enforceAuth = (req, res, next) => {
                 next();
             })
             .catch(() => {
-                req.user = user; // fallback to token role if DB unreachable
-                next();
+                return res.status(503).json({ error: 'Service temporarily unavailable. Please retry.' });
             });
     });
 };
@@ -339,7 +335,8 @@ app.post('/api/auth/change-password', enforceAuth, async (req, res) => {
     try {
         const { current_password, new_password } = req.body;
         if (!current_password || !new_password) return res.status(400).json({ error: 'current_password and new_password are required.' });
-        if (new_password.length < 8)             return res.status(400).json({ error: 'New password must be at least 8 characters.' });
+        if (new_password.length < 12 || !/[A-Z]/.test(new_password) || !/[a-z]/.test(new_password) || !/[0-9]/.test(new_password) || !/[^A-Za-z0-9]/.test(new_password))
+            return res.status(400).json({ error: 'New password must be at least 12 characters and contain uppercase, lowercase, a number, and a special character.' });
 
         const { rows } = await pgPool.query('SELECT * FROM explorer_users WHERE username = $1', [req.user.username]);
         if (!rows.length) return res.status(404).json({ error: 'User not found.' });

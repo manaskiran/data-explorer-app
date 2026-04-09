@@ -5,6 +5,8 @@ const mysql = require('mysql2/promise');
 const { Client } = require('pg');
 const { decrypt } = require('../utils/crypto');
 
+const isValidIdentifier = (name) => typeof name === 'string' && /^[a-zA-Z0-9_\-]+$/.test(name);
+
 const SYSTEM_DBS = ['information_schema', 'sys', '_statistics_', 'mysql',
                     'performance_schema', 'default', 'hudi_metadata'];
 const TABLE_EXCLUDE_RE = /(_ro|_rt|_temp|_tmp|_bak|_backup)$|^[_\.]/i;
@@ -33,6 +35,7 @@ async function getTableCountSingle(pool, catalogName, connType) {
             if (rows.length > 0) return rows.filter(r => !TABLE_EXCLUDE_RE.test(r.tbl)).length;
 
             // Fallback: enumerate databases then batch-count tables
+            if (!catalogName || !/^[a-zA-Z0-9_\-]+$/.test(catalogName)) return 0;
             const [dbRows] = await pool.query(`SHOW DATABASES FROM \`${catalogName}\``);
             const dbs = dbRows.map(r => Object.values(r)[0])
                               .filter(d => !SYSTEM_DBS.includes(d.toLowerCase()));
@@ -142,11 +145,11 @@ router.get('/stats', async (req, res) => {
 // ── FIX #16: paginated global search ─────────────────────────────────────────
 router.post('/global-search', async (req, res) => {
     try {
-        const { query, page = 1, limit = 20 } = req.body;
+        const { query, page = 1, limit = 100 } = req.body;
         if (!query || query.trim().length < 2) return res.json({ results: [], total: 0, page: 1, pages: 0 });
 
         const safePage  = Math.max(1, parseInt(page)  || 1);
-        const safeLimit = Math.min(50, Math.max(1, parseInt(limit) || 20));
+        const safeLimit = Math.min(200, Math.max(1, parseInt(limit) || 100));
 
         const { rows: connections } = req.user.role === 'admin'
             ? await pgPool.query('SELECT * FROM explorer_connections')
@@ -241,7 +244,9 @@ router.post('/global-search', async (req, res) => {
             }
         }));
 
-        allResults.sort((a, b) => a.type.localeCompare(b.type));
+        // Sort: database first, then table, then dag — so DB/table results are never buried behind DAGs
+        const TYPE_PRIORITY = { database: 0, table: 1, dag: 2 };
+        allResults.sort((a, b) => (TYPE_PRIORITY[a.type] ?? 3) - (TYPE_PRIORITY[b.type] ?? 3));
         const total   = allResults.length;
         const pages   = Math.ceil(total / safeLimit);
         const offset  = (safePage - 1) * safeLimit;

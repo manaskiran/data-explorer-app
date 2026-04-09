@@ -2,7 +2,18 @@ const express = require('express'); const router = express.Router(); const mysql
 const { requireRole } = require('../middleware/rbac');
 const { isIdentifier, validateConnectionId, validateTableRef } = require('../middleware/validate');
 const { requireConnectionAccess } = require('../middleware/access');
+const rateLimit = require('express-rate-limit');
 const isValidIdentifier = isIdentifier; // backward compat alias
+
+// LLM rate limiter — 50 requests/hour per authenticated user (falls back to IP)
+const llmLimiter = rateLimit({
+    windowMs: 60 * 60 * 1000,
+    max: 50,
+    keyGenerator: (req) => req.user?.username || req.ip,
+    message: { error: 'LLM generation rate limit exceeded. Please try again later.' },
+    standardHeaders: true,
+    legacyHeaders: false,
+});
 const truncateSampleData = (rows, maxStrLen = 100) => rows.map(row => { const cleanRow = {}; for (let [key, val] of Object.entries(row)) { if (val === null || val === undefined) { cleanRow[key] = val; } else if (typeof val === 'object') { const strVal = JSON.stringify(val); cleanRow[key] = strVal.length > maxStrLen ? strVal.substring(0, maxStrLen) + '... [truncated]' : strVal; } else if (typeof val === 'string') { cleanRow[key] = val.length > maxStrLen ? val.substring(0, maxStrLen) + '... [truncated]' : val; } else { cleanRow[key] = val; } } return cleanRow; });
 
 router.post('/retrieve', requireConnectionAccess('connection_id'), async (req, res) => {
@@ -29,7 +40,7 @@ const ALLOWED_LLM_MODELS = new Set([
     'meta-llama/llama-3.1-70b-instruct', 'meta-llama/llama-3.1-8b-instruct',
 ]);
 
-router.post('/generate', requireRole('admin'), async (req, res) => {
+router.post('/generate', requireRole('admin'), llmLimiter, async (req, res) => {
     try {
         const { connection_id, db_name, table_name } = req.body;
         const schema = Array.isArray(req.body.schema) ? req.body.schema.slice(0, 200) : [];
