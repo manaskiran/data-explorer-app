@@ -5,7 +5,8 @@ const helmet = require('helmet');
 const https = require('https');
 const fs = require('fs');
 const compression = require('compression');
-const rateLimit = require('express-rate-limit');
+const expressRateLimit = require('express-rate-limit');
+const rateLimit = expressRateLimit.rateLimit || expressRateLimit;
 const cookieParser = require('cookie-parser');
 const jwt = require('jsonwebtoken');
 const bcrypt = require('bcrypt');
@@ -39,7 +40,11 @@ const USE_HTTPS = (() => {
     const k = process.env.SSL_KEY_PATH;
     const c = process.env.SSL_CERT_PATH;
     if (!k || !c) return false;
-    try { fs.accessSync(k); fs.accessSync(c); return true; } catch { return false; }
+    try { 
+        fs.accessSync(k, fs.constants.R_OK); 
+        fs.accessSync(c, fs.constants.R_OK); 
+        return true; 
+    } catch { return false; }
 })();
 if (!USE_HTTPS) console.warn('[WARN] SSL certs not found — starting in HTTP mode (dev only)');
 
@@ -113,40 +118,43 @@ app.use(cors({
 }));
 
 // ─── Rate limiters ────────────────────────────────────────────────────────────
+const RL_WINDOW_MS         = parseInt(process.env.RATE_LIMIT_WINDOW_MS)          || 15 * 60 * 1000;
+const RL_MAX_GENERAL       = parseInt(process.env.RATE_LIMIT_MAX_GENERAL)        || 2000;
+const RL_MAX_AUTH          = parseInt(process.env.RATE_LIMIT_MAX_AUTH)           || 15;
+const RL_MAX_ADMIN         = parseInt(process.env.RATE_LIMIT_MAX_ADMIN)          || 300;
+const RL_MAX_METADATA      = parseInt(process.env.RATE_LIMIT_MAX_METADATA)       || 500;
+const RL_WINDOW_EXPORT_MS  = parseInt(process.env.RATE_LIMIT_WINDOW_EXPORT_MS)   || 60 * 60 * 1000;
+const RL_MAX_EXPORT        = parseInt(process.env.RATE_LIMIT_MAX_EXPORT)         || 5;
+const RL_MAX_DATAWIZZ      = parseInt(process.env.RATE_LIMIT_MAX_DATAWIZZ)       || 10;
+
 app.use('/api/', rateLimit({
-    windowMs: 15 * 60 * 1000,
-    max: 2000,
+    windowMs: RL_WINDOW_MS, max: RL_MAX_GENERAL,
     message: { error: 'Too many requests. Please try again later.' },
     standardHeaders: true, legacyHeaders: false,
 }));
 app.use('/api/auth/', rateLimit({
-    windowMs: 15 * 60 * 1000,
-    max: 15,
+    windowMs: RL_WINDOW_MS, max: RL_MAX_AUTH,
     message: { error: 'Too many login attempts. Please try again in 15 minutes.' },
     standardHeaders: true, legacyHeaders: false,
 }));
 app.use('/api/admin/', rateLimit({
-    windowMs: 15 * 60 * 1000,
-    max: 300,
+    windowMs: RL_WINDOW_MS, max: RL_MAX_ADMIN,
     message: { error: 'Too many admin requests. Please try again later.' },
     standardHeaders: true, legacyHeaders: false,
 }));
 app.use('/api/table-metadata/', rateLimit({
-    windowMs: 15 * 60 * 1000,
-    max: 500,
+    windowMs: RL_WINDOW_MS, max: RL_MAX_METADATA,
     message: { error: 'Too many metadata requests. Please try again later.' },
     standardHeaders: true, legacyHeaders: false,
 }));
-// Strict rate limit for heavy export/build operations (max 5/hour per IP)
+// Strict rate limit for heavy export/build operations
 app.use('/api/explore/export/', rateLimit({
-    windowMs: 60 * 60 * 1000,
-    max: 5,
+    windowMs: RL_WINDOW_EXPORT_MS, max: RL_MAX_EXPORT,
     message: { error: 'Export rate limit exceeded. Please wait before exporting again.' },
     standardHeaders: true, legacyHeaders: false,
 }));
 app.use('/api/datawizz/build', rateLimit({
-    windowMs: 60 * 60 * 1000,
-    max: 10,
+    windowMs: RL_WINDOW_EXPORT_MS, max: RL_MAX_DATAWIZZ,
     message: { error: 'Dashboard build rate limit exceeded. Please wait.' },
     standardHeaders: true, legacyHeaders: false,
 }));
@@ -156,13 +164,13 @@ app.use(cookieParser());
 
 // ─── Body parsing ─────────────────────────────────────────────────────────────
 app.use(express.json({
-    limit: '5mb',
+    limit: process.env.EXPRESS_JSON_LIMIT || '5mb',
     verify: (req, _res, buf) => { req.rawBody = buf; },
 }));
 
 // ─── Response size guard (FIX #22) ───────────────────────────────────────────
 // Caps JSON responses at 10 MB to prevent unbounded payload growth
-const MAX_RESPONSE_BYTES = 10 * 1024 * 1024; // 10 MB
+const MAX_RESPONSE_BYTES = parseInt(process.env.MAX_RESPONSE_BYTES) || 10 * 1024 * 1024; // default 10 MB
 app.use((req, res, next) => {
     const _json = res.json.bind(res);
     res.json = function (body) {
@@ -418,4 +426,3 @@ server.listen(PORT, async () => {
     const proto = USE_HTTPS ? 'HTTPS' : 'HTTP';
     console.log(JSON.stringify({ level: 'INFO', timestamp: new Date().toISOString(), message: `Backend running on port ${PORT} (${proto})` }));
 });
-

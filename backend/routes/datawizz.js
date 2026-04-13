@@ -518,8 +518,8 @@ async function fetchSchemaFromExplorer(connectionId, dbName, tableName, pgPool) 
 
     // Get live schema via StarRocks / Hive connection
     const srHost = conn.host;
-    const srPort = conn.type === 'starrocks' ? conn.port : 9030;
-    const srUser = conn.type === 'starrocks' ? conn.username : (conn.sr_username || 'root');
+    const srPort = conn.type === 'starrocks' ? conn.port : (parseInt(process.env.SR_FE_PORT) || 9030);
+    const srUser = conn.type === 'starrocks' ? conn.username : (conn.sr_username || process.env.SR_DEFAULT_USER || 'root');
     const srPass = conn.type === 'starrocks' ? decrypt(conn.password) : (decrypt(conn.sr_password) || '');
 
     const dbConn = await mysql.createConnection({ host: srHost, port: srPort, user: srUser, password: srPass });
@@ -931,7 +931,7 @@ router.get('/plan', async (req, res) => {
  * POST /api/datawizz/build — SSE endpoint
  * Builds charts + dashboard in Superset and runs QA review.
  *
- * Body: { plan, datasetInfo, dataset_name, superset_connection_id | (superset_url+superset_username+superset_password), dashboard_id? }
+ * Body: { plan, datasetInfo, dataset_name, superset_connection_id | (url+username+password), dashboard_id? }
  */
 router.post('/build', async (req, res) => {
     const { plan, datasetInfo, dataset_name, dashboard_id } = req.body;

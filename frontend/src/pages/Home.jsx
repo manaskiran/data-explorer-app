@@ -33,7 +33,7 @@ export default function Home() {
                 setSearchResults([]);
                 setSearchTotal(0);
             }
-        }, 400); 
+        }, 400);
         return () => clearTimeout(delayDebounceFn);
     }, [searchQuery]);
 

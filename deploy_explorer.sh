@@ -84,9 +84,9 @@ const pgPool = new Pool({
     password: process.env.PG_PASSWORD,
     port:     process.env.PG_PORT,
     // Connection pool tuning for production
-    max:              10,
-    idleTimeoutMillis: 30000,
-    connectionTimeoutMillis: 5000,
+    max:              parseInt(process.env.PG_POOL_MAX)          || 10,
+    idleTimeoutMillis: parseInt(process.env.PG_IDLE_TIMEOUT_MS)  || 30000,
+    connectionTimeoutMillis: parseInt(process.env.PG_CONNECT_TIMEOUT_MS) || 5000,
 });
 
 // Helper: run DDL silently (idempotent schema changes)
@@ -287,7 +287,7 @@ function getConnConfig(conn) {
     if (conn.type === 'starrocks') {
         return { port: conn.port, user: conn.username, password: decrypt(conn.password) };
     }
-    return { port: 9030, user: conn.sr_username || process.env.SR_DEFAULT_USER || 'root', password: decrypt(conn.sr_password) || '' };
+    return { port: parseInt(process.env.SR_FE_PORT) || 9030, user: conn.sr_username || process.env.SR_DEFAULT_USER || 'root', password: decrypt(conn.sr_password) || '' };
 }
 
 module.exports = { encrypt, decrypt, getConnConfig };
@@ -763,9 +763,53 @@ class SupersetClient {
                 : setCookie.split(';')[0];
         }
 
-        // Fetch CSRF token
-        const csrfResp = await this._request('GET', '/api/v1/security/csrf_token/');
-        this._csrfToken = csrfResp.result;
+        // Fetch CSRF token — call axios directly so we can capture any new session cookie
+        const csrfResp = await axios({
+            method: 'GET',
+            url: `${this.baseUrl}/api/v1/security/csrf_token/`,
+            headers: this._headers(),
+            validateStatus: () => true,
+        });
+        if (csrfResp.status < 200 || csrfResp.status >= 300) {
+            throw new Error(`Failed to get CSRF token [${csrfResp.status}]: ${JSON.stringify(csrfResp.data)}`);
+        }
+
+        // Merge any updated session cookies returned by the CSRF endpoint FIRST,
+        // so the session is correct before we store the CSRF token
+        const csrfSetCookie = csrfResp.headers['set-cookie'];
+        if (csrfSetCookie) {
+            const newCookies = (Array.isArray(csrfSetCookie) ? csrfSetCookie : [csrfSetCookie])
+                .map(c => c.split(';')[0]);
+            const cookieMap = new Map();
+            this._cookies.split('; ').filter(Boolean).forEach(c => {
+                const [k] = c.split('=');
+                if (k) cookieMap.set(k, c);
+            });
+            newCookies.forEach(c => {
+                const [k] = c.split('=');
+                if (k) cookieMap.set(k, c);
+            });
+            this._cookies = [...cookieMap.values()].join('; ');
+        }
+
+        // Extract CSRF token — try all known response fields across Superset versions
+        this._csrfToken = csrfResp.data?.result
+            || csrfResp.data?.token
+            || csrfResp.data?.csrf_token;
+
+        // Fallback: some Superset configs set the CSRF token as a non-HttpOnly cookie
+        if (!this._csrfToken && csrfSetCookie) {
+            const cookieList = Array.isArray(csrfSetCookie) ? csrfSetCookie : [csrfSetCookie];
+            for (const c of cookieList) {
+                const m = c.match(/^csrf_token=([^;]+)/i);
+                if (m) { this._csrfToken = decodeURIComponent(m[1]); break; }
+            }
+        }
+
+        if (!this._csrfToken) {
+            throw new Error(`CSRF token not returned by Superset (response: ${JSON.stringify(csrfResp.data)}). ` +
+                `Ensure WTF_CSRF_ENABLED is True and the /api/v1/security/csrf_token/ endpoint is accessible.`);
+        }
     }
 
     _headers() {
@@ -790,6 +834,15 @@ class SupersetClient {
 
         // Auto re-auth on 401
         if (resp.status === 401 && this._username) {
+            await this.authenticate();
+            config.headers = this._headers();
+            resp = await axios(config);
+        }
+
+        // Auto re-auth on CSRF failure (400 with "CSRF session token is missing")
+        const isCsrfError = resp.status === 400 &&
+            JSON.stringify(resp.data).toLowerCase().includes('csrf');
+        if (isCsrfError && this._username) {
             await this.authenticate();
             config.headers = this._headers();
             resp = await axios(config);
@@ -1593,8 +1646,8 @@ async function fetchSchemaFromExplorer(connectionId, dbName, tableName, pgPool) 
 
     // Get live schema via StarRocks / Hive connection
     const srHost = conn.host;
-    const srPort = conn.type === 'starrocks' ? conn.port : 9030;
-    const srUser = conn.type === 'starrocks' ? conn.username : (conn.sr_username || 'root');
+    const srPort = conn.type === 'starrocks' ? conn.port : (parseInt(process.env.SR_FE_PORT) || 9030);
+    const srUser = conn.type === 'starrocks' ? conn.username : (conn.sr_username || process.env.SR_DEFAULT_USER || 'root');
     const srPass = conn.type === 'starrocks' ? decrypt(conn.password) : (decrypt(conn.sr_password) || '');
 
     const dbConn = await mysql.createConnection({ host: srHost, port: srPort, user: srUser, password: srPass });
@@ -2006,7 +2059,7 @@ router.get('/plan', async (req, res) => {
  * POST /api/datawizz/build — SSE endpoint
  * Builds charts + dashboard in Superset and runs QA review.
  *
- * Body: { plan, datasetInfo, dataset_name, superset_connection_id | (superset_url+superset_username+superset_password), dashboard_id? }
+ * Body: { plan, datasetInfo, dataset_name, superset_connection_id | (url+username+password), dashboard_id? }
  */
 router.post('/build', async (req, res) => {
     const { plan, datasetInfo, dataset_name, dashboard_id } = req.body;
@@ -2280,8 +2333,8 @@ async function runGlobalObservabilityScan() {
                 if (conn.type === 'airflow') continue;
 
                 console.log(`\n[CRON] Scanning Connection: ${conn.name} (${conn.type})`);
-                const srHost = conn.host; const srPort = conn.type === 'starrocks' ? conn.port : 9030;
-                const srUser = conn.type === 'starrocks' ? conn.username : (conn.sr_username || 'root');
+                const srHost = conn.host; const srPort = conn.type === 'starrocks' ? conn.port : (parseInt(process.env.SR_FE_PORT) || 9030);
+                const srUser = conn.type === 'starrocks' ? conn.username : (conn.sr_username || process.env.SR_DEFAULT_USER || 'root');
                 const srPassword = conn.type === 'starrocks' ? decrypt(conn.password) : (decrypt(conn.sr_password) || '');
                 let mysqlConn;
                 try {
@@ -3132,11 +3185,26 @@ EOF
 
 cat << 'EOF' > $APP_DIR/backend/routes/explore.js
 const express = require('express'); const router = express.Router(); const mysql = require('mysql2/promise'); const excel = require('exceljs'); const hive = require('hive-driver'); const { TCLIService, TCLIService_types } = hive.thrift; const { pgPool } = require('../db'); const { decrypt } = require('../utils/crypto');
+const http = require('http'); const https = require('https');
+const fetchWebHDFS = (url) => new Promise((resolve, reject) => {
+    const lib = url.startsWith('https') ? https : http;
+    const options = url.startsWith('https') ? { rejectUnauthorized: false } : {};
+    const req = lib.get(url, options, (res) => {
+        if (res.statusCode === 307 && res.headers.location) {
+            return fetchWebHDFS(res.headers.location).then(resolve).catch(reject);
+        }
+        let data = '';
+        res.on('data', chunk => data += chunk);
+        res.on('end', () => { try { resolve(JSON.parse(data)); } catch(e) { reject(e); } });
+    });
+    req.setTimeout(8000, () => { req.destroy(); reject(new Error('WebHDFS timeout')); });
+    req.on('error', reject);
+});
 const { maskDataPreview } = require('../utils/masking');
 const { requireConnectionAccess } = require('../middleware/access');
 const globalHiveCache = {};
-const HIVE_CACHE_TTL_MS  = 5 * 60 * 1000;
-const HIVE_CACHE_MAX_KEYS = 500;
+const HIVE_CACHE_TTL_MS   = parseInt(process.env.HIVE_CACHE_TTL_MS)    || 5 * 60 * 1000;
+const HIVE_CACHE_MAX_KEYS = parseInt(process.env.HIVE_CACHE_MAX_KEYS)  || 500;
 setInterval(() => {
     const now = Date.now();
     for (const connId of Object.keys(globalHiveCache)) {
@@ -3148,7 +3216,7 @@ setInterval(() => {
         }
         if (Object.keys(bucket).length === 0) delete globalHiveCache[connId];
     }
-}, 10 * 60 * 1000).unref();
+}, parseInt(process.env.HIVE_CACHE_CLEANUP_INTERVAL_MS) || 10 * 60 * 1000).unref();
 function hiveCacheEvict(bucket) {
     const tsKeys = Object.keys(bucket).filter(k => k.endsWith('__ts'));
     if (tsKeys.length < HIVE_CACHE_MAX_KEYS) return;
@@ -3158,8 +3226,8 @@ function hiveCacheEvict(bucket) {
 }
 const isValidIdentifier = (name) => typeof name === 'string' && /^[a-zA-Z0-9_\-]+$/.test(name);
 
-const HIVE_CONNECT_TIMEOUT_MS = 20000;
-const HIVE_QUERY_TIMEOUT_MS   = 30000;
+const HIVE_CONNECT_TIMEOUT_MS = parseInt(process.env.HIVE_CONNECT_TIMEOUT_MS) || 20000;
+const HIVE_QUERY_TIMEOUT_MS   = parseInt(process.env.HIVE_QUERY_TIMEOUT_MS)   || 30000;
 
 const withTimeout = (promise, ms, label) =>
     Promise.race([
@@ -3234,7 +3302,7 @@ router.post('/explore/fetch', requireConnectionAccess('id'), async (req, res) =>
             } finally { await connection.end(); }
         } else if (conn.type === 'hive') {
             // All Hive operations go through StarRocks MySQL (hudi_catalog) — direct Hive TCP is not used
-            const connection = await getSrConnection(conn.host, 9030, conn.sr_username || process.env.SR_DEFAULT_USER || 'root', decrypt(conn.sr_password) || '');
+            const connection = await getSrConnection(conn.host, parseInt(process.env.SR_FE_PORT) || 9030, conn.sr_username || process.env.SR_DEFAULT_USER || 'root', decrypt(conn.sr_password) || '');
             try {
                 await connection.query('SET CATALOG hudi_catalog;');
                 if (type === 'databases') {
@@ -3259,34 +3327,63 @@ router.post('/search/fetch', requireConnectionAccess('id'), async (req, res) => 
         const conn = rows[0]; conn.password = decrypt(conn.password); conn.sr_password = decrypt(conn.sr_password);
         if (conn.type === 'starrocks') { const connection = await getSrConnection(conn.host, conn.port, conn.username, conn.password); const [result] = await connection.query(`SELECT TABLE_SCHEMA as db, TABLE_NAME as tbl, COLUMN_NAME as col FROM information_schema.columns WHERE COLUMN_NAME LIKE ? LIMIT 100`, [`%${col}%`]); await connection.end(); res.json(result); } 
         else if (conn.type === 'hive') {
-            if (!globalHiveCache[id]) globalHiveCache[id] = {}; const myCache = globalHiveCache[id]; let setup = await setupHiveClient(conn);
+            if (!globalHiveCache[id]) globalHiveCache[id] = {};
+            const myCache = globalHiveCache[id];
+            hiveCacheEvict(myCache);
+            const setup = await setupHiveClient(conn);
             try {
-                let results = []; const startTime = Date.now(); let timeLimitHit = false; const safeQuery = async (q, t) => Promise.race([ setup.executeQuery(q), new Promise((_, r) => setTimeout(() => r(new Error('TIMEOUT')), t)) ]);
-                const dbRows = await safeQuery('SHOW DATABASES', 15000); const dbs = (dbRows || []).map(r => Object.values(r)[0]).filter(d => d && d !== 'information_schema' && d !== 'sys');
+                let results = [];
+                const startTime = Date.now();
+                let timeLimitHit = false;
+                const safeQuery = async (q, t) => withTimeout(setup.executeQuery(q), t, q.slice(0, 40));
+                const dbRows = await safeQuery('SHOW DATABASES', 15000);
+                const dbs = (dbRows || []).map(r => Object.values(r)[0]).filter(d => d && d !== 'information_schema' && d !== 'sys' && d !== 'hudi_metadata');
                 for (let i = 0; i < dbs.length; i++) {
                     if (timeLimitHit) break;
                     try {
-                        const tableRows = await safeQuery(`SHOW TABLES IN \`${dbs[i]}\``, 10000); const tables = (tableRows || []).map(r => Object.values(r)[Object.values(r).length - 1]);
+                        const tableRows = await safeQuery(\`SHOW TABLES IN \\\`\${dbs[i]}\\\`\`, 10000);
+                        const tables = (tableRows || []).map(r => Object.values(r)[Object.values(r).length - 1]);
                         for (let j = 0; j < tables.length; j += 10) {
                             if (Date.now() - startTime > 55000 || results.length >= 100) { timeLimitHit = true; break; }
                             await Promise.all(tables.slice(j, j + 10).map(async (tName) => {
-                                const cacheKey = `${dbs[i]}.${tName}`; let columns = myCache[cacheKey]; 
-                                if (!columns || (myCache[`${cacheKey}__ts`] && Date.now() - myCache[`${cacheKey}__ts`] > HIVE_CACHE_TTL_MS)) {
-                                    try { const schema = await safeQuery(`DESCRIBE \`${dbs[i]}\`.\`${tName}\``, 6000); if (schema && schema.length > 0) { columns = schema.filter(r => r.col_name).map(r => r.col_name); hiveCacheEvict(myCache); myCache[cacheKey] = columns; myCache[`${cacheKey}__ts`] = Date.now(); } else { columns = []; } } catch(e) { console.warn(`[HiveCache] DESCRIBE failed for ${cacheKey}:`, e.message); columns = []; } }
-                                for (let c of columns) { if (c.toLowerCase().includes(col.toLowerCase())) results.push({ db: dbs[i], tbl: tName, col: c }); }
+                                const cacheKey = \`\${dbs[i]}.\${tName}\`;
+                                let columns = myCache[cacheKey];
+                                const cacheTs = myCache[\`\${cacheKey}__ts\`];
+                                if (!columns || (cacheTs && Date.now() - cacheTs > HIVE_CACHE_TTL_MS)) {
+                                    try {
+                                        const schema = await safeQuery(\`DESCRIBE \\\`\${dbs[i]}\\\`.\\\`\${tName}\\\`\`, 6000);
+                                        if (schema && schema.length > 0) {
+                                            columns = schema.filter(r => r.col_name).map(r => r.col_name);
+                                            myCache[cacheKey] = columns;
+                                            myCache[\`\${cacheKey}__ts\`] = Date.now();
+                                        } else { columns = []; }
+                                    } catch (e) {
+                                        console.warn(\`[HiveCache] DESCRIBE failed for \${cacheKey}:\`, e.message);
+                                        columns = [];
+                                    }
+                                }
+                                for (const c of columns) {
+                                    if (c.toLowerCase().includes(col.toLowerCase()))
+                                        results.push({ db: dbs[i], tbl: tName, col: c });
+                                }
                             }));
                         }
-                    } catch(e) { console.warn(`[HiveSearch] DB ${dbs[i]} error:`, e.message); }
+                    } catch (e) { console.warn(\`[HiveSearch] DB \${dbs[i]} error:\`, e.message); }
                 }
                 res.json(results);
-            } catch (e) { res.status(500).json({ error: "Hive cluster disconnected." }); } finally { try{if(setup.session) await setup.session.close();}catch(e){} try{if(setup.client) await setup.client.close();}catch(e){} }
+            } catch (e) {
+                res.status(500).json({ error: 'Hive cluster disconnected or timed out.' });
+            } finally {
+                try { if (setup.session) await setup.session.close(); } catch (e) {}
+                try { if (setup.client) await setup.client.close(); } catch (e) {}
+            }
         }
     } catch (e) { console.error("[Search Fetch Error]:", e); res.status(500).json({ error: "Failed to perform global search." }); }
 });
 
 router.post('/export/fetch', requireConnectionAccess('id'), async (req, res) => {
-    const EXPORT_ROW_LIMIT  = 50000;
-    const EXPORT_TIMEOUT_MS = 120000;
+    const EXPORT_ROW_LIMIT  = parseInt(process.env.EXPORT_ROW_LIMIT)  || 50000;
+    const EXPORT_TIMEOUT_MS = parseInt(process.env.EXPORT_TIMEOUT_MS) || 120000;
     req.setTimeout(EXPORT_TIMEOUT_MS); 
     try {
         const { rows } = await pgPool.query('SELECT * FROM explorer_connections WHERE id = $1', [req.body.id]); if (!rows.length) return res.status(404).json({ error: 'Connection not found' });
@@ -3305,14 +3402,16 @@ router.post('/export/fetch', requireConnectionAccess('id'), async (req, res) => 
                 const [cols] = await connection.query(`SELECT TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME, DATA_TYPE, COLUMN_COMMENT FROM information_schema.columns WHERE TABLE_SCHEMA = ? ORDER BY TABLE_NAME, ORDINAL_POSITION LIMIT ${EXPORT_ROW_LIMIT}`, [req.body.db]);
                 cols.forEach(c => { const overrideComment = dbMeta[c.TABLE_NAME]?.[c.COLUMN_NAME]; worksheet.addRow({ db: c.TABLE_SCHEMA, table: c.TABLE_NAME, column: c.COLUMN_NAME, type: c.DATA_TYPE, comment: overrideComment || c.COLUMN_COMMENT || '' }); });
             } finally { await connection.end(); }
-        } else {
-            let setup = await setupHiveClient(conn);
+        } else if (conn.type === 'hive') {
+            const connection = await getSrConnection(conn.host, parseInt(process.env.SR_FE_PORT) || 9030, conn.sr_username || process.env.SR_DEFAULT_USER || 'root', decrypt(conn.sr_password) || '');
             try {
-                // isValidIdentifier already enforced above; use backtick quoting for Hive identifier safety
-                const safeDb = req.body.db.replace(/`/g, '');
-                const allCols = await Promise.race([ setup.executeQuery(`SELECT table_name, column_name, data_type, comment FROM information_schema.columns WHERE table_schema = \`${safeDb}\` LIMIT ${EXPORT_ROW_LIMIT}`), new Promise((_, r) => setTimeout(() => r(new Error("FAST_TIMEOUT")), 15000)) ]);
-                if (allCols && allCols.length > 0) { allCols.forEach(r => { const override = dbMeta[Object.values(r)[0]]?.[Object.values(r)[1]]; worksheet.addRow({ db: req.body.db, table: Object.values(r)[0], column: Object.values(r)[1], type: Object.values(r)[2] || '', comment: override || Object.values(r)[3] || '' }); }); }
-            } catch (err) { console.warn('[Export] Hive info_schema query failed:', err.message); } finally { try{if(setup.session) await setup.session.close();}catch(e){ console.warn('[Export] Hive session close failed:', e.message); } try{if(setup.client) await setup.client.close();}catch(e){ console.warn('[Export] Hive client close failed:', e.message); } }
+                await connection.query('SET CATALOG hudi_catalog;');
+                const [cols] = await connection.query(
+                    \`SELECT TABLE_NAME, COLUMN_NAME, DATA_TYPE, COLUMN_COMMENT FROM information_schema.columns WHERE TABLE_SCHEMA = ? ORDER BY TABLE_NAME, ORDINAL_POSITION LIMIT \${EXPORT_ROW_LIMIT}\`,
+                    [req.body.db]
+                );
+                cols.forEach(c => { const overrideComment = dbMeta[c.TABLE_NAME]?.[c.COLUMN_NAME]; worksheet.addRow({ db: req.body.db, table: c.TABLE_NAME, column: c.COLUMN_NAME, type: c.DATA_TYPE, comment: overrideComment || c.COLUMN_COMMENT || '' }); });
+            } finally { await connection.end(); }
         }
         res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'); res.setHeader('Content-Disposition', `attachment; filename="${encodeURIComponent(req.body.db)}_data_dictionary.xlsx"`);
         await workbook.xlsx.write(res); res.end();
@@ -3324,7 +3423,7 @@ router.post('/explore/preview', requireConnectionAccess('connection_id'), async 
         const { connection_id, db_name, table_name } = req.body; const { rows } = await pgPool.query('SELECT * FROM explorer_connections WHERE id = $1', [connection_id]); if (!rows.length) return res.status(404).json({ error: 'Connection not found' });
         if (!isValidIdentifier(db_name) || !isValidIdentifier(table_name)) return res.status(400).json({ error: "Invalid identifiers" });
         const conn = rows[0]; let sampleData = [];
-        const connection = await getSrConnection(conn.host, conn.type === 'starrocks' ? conn.port : 9030, conn.type === 'starrocks' ? conn.username : (conn.sr_username || 'root'), conn.type === 'starrocks' ? decrypt(conn.password) : (decrypt(conn.sr_password) || ''));
+        const connection = await getSrConnection(conn.host, conn.type === 'starrocks' ? conn.port : (parseInt(process.env.SR_FE_PORT) || 9030), conn.type === 'starrocks' ? conn.username : (conn.sr_username || process.env.SR_DEFAULT_USER || 'root'), conn.type === 'starrocks' ? decrypt(conn.password) : (decrypt(conn.sr_password) || ''));
         try { if (conn.type === 'hive') await connection.query('SET CATALOG hudi_catalog;'); const [dataRows] = await connection.query(`SELECT * FROM \`${db_name}\`.\`${table_name}\` LIMIT 50`); sampleData = dataRows; } catch (dataErr) { return res.status(500).json({ error: "Could not read data sample" }); } finally { await connection.end(); }
         
         const maskedSample = sampleData.map(row => {
@@ -3340,7 +3439,7 @@ router.post('/explore/profile-column', requireConnectionAccess('connection_id'),
         const { connection_id, db_name, table_name, column_name } = req.body; if (!isValidIdentifier(db_name) || !isValidIdentifier(table_name) || !isValidIdentifier(column_name)) return res.status(400).json({ error: "Invalid identifiers" });
         const { rows } = await pgPool.query('SELECT * FROM explorer_connections WHERE id = $1', [connection_id]); if (!rows.length) return res.status(404).json({ error: 'Connection not found' });
         const conn = rows[0];
-        const connection = await getSrConnection(conn.host, conn.type === 'starrocks' ? conn.port : 9030, conn.type === 'starrocks' ? conn.username : (conn.sr_username || 'root'), conn.type === 'starrocks' ? decrypt(conn.password) : (decrypt(conn.sr_password) || ''));
+        const connection = await getSrConnection(conn.host, conn.type === 'starrocks' ? conn.port : (parseInt(process.env.SR_FE_PORT) || 9030), conn.type === 'starrocks' ? conn.username : (conn.sr_username || process.env.SR_DEFAULT_USER || 'root'), conn.type === 'starrocks' ? decrypt(conn.password) : (decrypt(conn.sr_password) || ''));
         try {
             if (conn.type === 'hive') await connection.query('SET CATALOG hudi_catalog;');
             const [stats] = await connection.query(`SELECT COUNT(*) as total_rows, COUNT(DISTINCT \`${column_name}\`) as distinct_count, SUM(CASE WHEN \`${column_name}\` IS NULL THEN 1 ELSE 0 END) as null_count, MIN(CAST(\`${column_name}\` AS VARCHAR)) as min_val, MAX(CAST(\`${column_name}\` AS VARCHAR)) as max_val FROM \`${db_name}\`.\`${table_name}\``);
@@ -3368,7 +3467,7 @@ router.post('/explore/query', requireConnectionAccess('connection_id'), async (r
         }
 
         let results = [];
-        const connection = await getSrConnection(conn.host, conn.type === 'starrocks' ? conn.port : 9030, conn.type === 'starrocks' ? conn.username : (conn.sr_username || 'root'), conn.type === 'starrocks' ? decrypt(conn.password) : (decrypt(conn.sr_password) || ''));
+        const connection = await getSrConnection(conn.host, conn.type === 'starrocks' ? conn.port : (parseInt(process.env.SR_FE_PORT) || 9030), conn.type === 'starrocks' ? conn.username : (conn.sr_username || process.env.SR_DEFAULT_USER || 'root'), conn.type === 'starrocks' ? decrypt(conn.password) : (decrypt(conn.sr_password) || ''));
         
         // FIX #17: inject LIMIT if query has none, cap at 500 rows fetched from DB
         const hasLimit = /\bLIMIT\s+\d+/i.test(safeQuery);
@@ -3396,10 +3495,11 @@ router.post('/explore/table-details', requireConnectionAccess('connection_id'), 
         if (!rows.length) return res.status(404).json({ error: 'Connection not found' });
         
         const conn = rows[0];
-        const connection = await getSrConnection(conn.host, conn.type === 'starrocks' ? conn.port : 9030, conn.type === 'starrocks' ? conn.username : (conn.sr_username || 'root'), conn.type === 'starrocks' ? decrypt(conn.password) : (decrypt(conn.sr_password) || ''));
+        const connection = await getSrConnection(conn.host, conn.type === 'starrocks' ? conn.port : (parseInt(process.env.SR_FE_PORT) || 9030), conn.type === 'starrocks' ? conn.username : (conn.sr_username || process.env.SR_DEFAULT_USER || 'root'), conn.type === 'starrocks' ? decrypt(conn.password) : (decrypt(conn.sr_password) || ''));
 
         let totalRows = 0;
         let tableSize = 'N/A';
+        let numFiles = 0;
         let hudiConfig = { isHudi: false, tableType: 'N/A', recordKeys: 'N/A', precombineKey: 'N/A', partitionFields: 'N/A' };
 
         const formatBytes = (bytes) => {
@@ -3429,47 +3529,70 @@ router.post('/explore/table-details', requireConnectionAccess('connection_id'), 
                 } catch(e) { console.warn('[TableDetails] Size fetch (StarRocks) failed:', e.message); }
             } else if (conn.type === 'hive') {
                 try {
-                    let setup = await setupHiveClient(conn);
-                    const descRows = await Promise.race([
-                        setup.executeQuery(`DESCRIBE FORMATTED \`${db_name}\`.\`${table_name}\``),
-                        new Promise((_, r) => setTimeout(() => r(new Error("TIMEOUT")), 10000))
-                    ]);
-                    
-                    for (let row of descRows) {
-                        let vals = Object.values(row).map(v => String(v || '').trim());
-                        let idx = vals.indexOf('totalSize');
-                        if (idx !== -1 && vals[idx + 1]) {
-                            const bytes = parseInt(vals[idx + 1]);
-                            if (!isNaN(bytes) && bytes > 0) {
-                                tableSize = formatBytes(bytes);
-                            }
-                            break;
+                    // Use the already-open StarRocks connection (SET CATALOG hudi_catalog already applied above)
+                    const [statusRes] = await connection.query(
+                        \`SHOW TABLE STATUS FROM \\\`\${db_name}\\\` LIKE ?\`, [table_name]
+                    );
+                    if (statusRes && statusRes.length > 0) {
+                        const dataLen = parseInt(statusRes[0].Data_length || 0);
+                        if (dataLen > 0) {
+                            tableSize = formatBytes(dataLen);
+                        } else {
+                            try {
+                                const [infoRes] = await connection.query(
+                                    \`SELECT DATA_LENGTH, TABLE_ROWS FROM information_schema.tables WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?\`,
+                                    [db_name, table_name]
+                                );
+                                if (infoRes && infoRes.length > 0 && parseInt(infoRes[0].DATA_LENGTH) > 0) {
+                                    tableSize = formatBytes(parseInt(infoRes[0].DATA_LENGTH));
+                                }
+                            } catch(e2) { /* keep N/A */ }
                         }
                     }
-                    try{if(setup.session) await setup.session.close();}catch(e){} 
-                    try{if(setup.client) await setup.client.close();}catch(e){}
-                } catch(e) { console.error("Hive size fetch error:", e.message); }
+                } catch(e) { console.warn('[TableDetails] Hive size fetch failed:', e.message); }
             }
 
-            // 3. Parse Hudi Configurations from DDL
+            // 3. Parse Hudi Configurations from DDL + extract HDFS location for size
             if (conn.type === 'hive' || conn.type === 'starrocks') {
                 try {
-                    const [createRes] = await connection.query(`SHOW CREATE TABLE \`${db_name}\`.\`${table_name}\``);
+                    const [createRes] = await connection.query(\`SHOW CREATE TABLE \\\`\${db_name}\\\`.\\\`\${table_name}\\\`\`);
                     const createStmt = Object.values(createRes[0])[1] || '';
-                    
+
                     if (createStmt.toLowerCase().includes('hudi') || createStmt.includes('_hoodie_')) {
                         hudiConfig.isHudi = true;
-                        
+
                         const parseProp = (str, prop) => {
-                            const regex = new RegExp(`['"]${prop}['"]\\s*=\\s*['"]([^'"]+)['"]`, 'i');
+                            const regex = new RegExp(\`['"]\${prop}['"]\\\\s*=\\\\s*['"]([^'"]+)['"]\`, 'i');
                             const match = str.match(regex);
                             return match ? match[1] : 'N/A';
                         };
-                        
+
                         hudiConfig.tableType = parseProp(createStmt, 'hoodie.table.type') !== 'N/A' ? parseProp(createStmt, 'hoodie.table.type') : 'COPY_ON_WRITE';
                         hudiConfig.recordKeys = parseProp(createStmt, 'hoodie.datasource.write.recordkey.field') !== 'N/A' ? parseProp(createStmt, 'hoodie.datasource.write.recordkey.field') : parseProp(createStmt, 'primaryKey');
                         hudiConfig.precombineKey = parseProp(createStmt, 'hoodie.datasource.write.precombine.field');
                         hudiConfig.partitionFields = parseProp(createStmt, 'hoodie.datasource.write.partitionpath.field');
+
+                        // Extract HDFS location and fetch real size + file count via WebHDFS
+                        if (conn.type === 'hive' && tableSize === 'N/A') {
+                            const locationMatch = createStmt.match(/"location"\s*=\s*"(hdfs:\/\/[^"]+)"/i);
+                            if (locationMatch) {
+                                try {
+                                    const hdfsUri = locationMatch[1];
+                                    const nnHost = (hdfsUri.match(/hdfs:\/\/([^:/]+)/) || [])[1];
+                                    const hdfsPath = hdfsUri.replace(/^hdfs:\/\/[^/]+/, '');
+                                    const webhdfsPort = parseInt(process.env.HDFS_WEBHDFS_PORT) || 9870;
+                                    const webhdfsUser = process.env.HDFS_WEBHDFS_USER || 'hadoop';
+                                    const webhdfsProto = process.env.HDFS_WEBHDFS_PROTOCOL || 'http';
+                                    const webhdfsUrl = \`\${webhdfsProto}://\${nnHost}:\${webhdfsPort}/webhdfs/v1\${hdfsPath}?op=GETCONTENTSUMMARY&user.name=\${webhdfsUser}\`;
+                                    const result = await fetchWebHDFS(webhdfsUrl);
+                                    if (result && result.ContentSummary) {
+                                        const { length, fileCount } = result.ContentSummary;
+                                        if (length > 0) tableSize = formatBytes(length);
+                                        numFiles = fileCount || 0;
+                                    }
+                                } catch(e) { console.warn('[TableDetails] WebHDFS size fetch failed:', e.message); }
+                            }
+                        }
                     }
                 } catch(e) { console.warn('[TableDetails] DDL/Hudi parse failed:', e.message); }
             }
@@ -3477,7 +3600,7 @@ router.post('/explore/table-details', requireConnectionAccess('connection_id'), 
             await connection.end();
         }
 
-        res.json({ totalRows, tableSize, hudiConfig });
+        res.json({ totalRows, tableSize, numFiles, hudiConfig });
     } catch (e) {
         console.error("[Table Details Error]:", e);
         res.status(500).json({ error: "Failed to fetch table details." });
@@ -3524,7 +3647,7 @@ const shouldSkipDb = (dbName) => {
 const isValidIdentifier = (name) => typeof name === 'string' && /^[a-zA-Z0-9_\-]+$/.test(name);
 
 const getSrConn = async (host, port, user, password) => {
-    const c = await mysql.createConnection({ host, port: Number(port), user: user || 'root', password: password || '', connectTimeout: 15000 });
+    const c = await mysql.createConnection({ host, port: Number(port), user: user || process.env.SR_DEFAULT_USER || 'root', password: password || '', connectTimeout: parseInt(process.env.MYSQL_CONNECT_TIMEOUT_MS) || 15000 });
     try { await c.query('SET new_planner_optimize_timeout = 300000;'); } catch (e) {}
     try { await c.query('SET query_timeout = 300;'); } catch (e) {}
     return c;
@@ -3772,8 +3895,8 @@ router.get('/stats', async (req, res) => {
                 return;
             }
 
-            const srPort     = conn.type === 'starrocks' ? conn.port : 9030;
-            const srUser     = conn.type === 'starrocks' ? conn.username : (conn.sr_username || 'root');
+            const srPort     = conn.type === 'starrocks' ? conn.port : (parseInt(process.env.SR_FE_PORT) || 9030);
+            const srUser     = conn.type === 'starrocks' ? conn.username : (conn.sr_username || process.env.SR_DEFAULT_USER || 'root');
             const srPassword = conn.type === 'starrocks' ? decrypt(conn.password) : (decrypt(conn.sr_password) || '');
             const catalog    = conn.type === 'hive' ? 'hudi_catalog' : 'default_catalog';
 
@@ -3781,7 +3904,7 @@ router.get('/stats', async (req, res) => {
             try {
                 pool = mysql.createPool({
                     host: conn.host, port: srPort, user: srUser, password: srPassword,
-                    connectionLimit: 5, connectTimeout: 5000
+                    connectionLimit: 5, connectTimeout: parseInt(process.env.MYSQL_CONNECT_TIMEOUT_MS) || 5000
                 });
 
                 // FIX #15: single query per connection (not per-database)
@@ -3858,8 +3981,8 @@ router.post('/global-search', async (req, res) => {
                 return;
             }
 
-            const srPort     = conn.type === 'starrocks' ? conn.port : 9030;
-            const srUser     = conn.type === 'starrocks' ? conn.username : (conn.sr_username || 'root');
+            const srPort     = conn.type === 'starrocks' ? conn.port : (parseInt(process.env.SR_FE_PORT) || 9030);
+            const srUser     = conn.type === 'starrocks' ? conn.username : (conn.sr_username || process.env.SR_DEFAULT_USER || 'root');
             const srPassword = conn.type === 'starrocks' ? decrypt(conn.password) : (decrypt(conn.sr_password) || '');
             const catalog    = conn.type === 'hive' ? 'hudi_catalog' : 'default_catalog';
 
@@ -3947,8 +4070,8 @@ const getSrPool = (host, port, user, password) => {
   const key = `${host}:${port}:${user}`;
   if (!mysqlPoolCache[key]) {
     mysqlPoolCache[key] = mysql.createPool({
-      host, port: Number(port), user: user || 'root', password: password || '',
-      connectionLimit: 10, connectTimeout: 15000
+      host, port: Number(port), user: user || process.env.SR_DEFAULT_USER || 'root', password: password || '',
+      connectionLimit: 10, connectTimeout: parseInt(process.env.MYSQL_CONNECT_TIMEOUT_MS) || 15000
     });
   }
   return mysqlPoolCache[key];
@@ -3988,7 +4111,7 @@ const getLayer = (dbName) => {
 const getApp = (dbName) => dbName.replace(/_service(_live|_odoo|_revenue|_odd)?$/, '').replace(/_curated(_live)?$/, '').replace(/_raw$/, '').replace(/_live$/, '').trim();
 
 const isBiTable = (tableName) => /^sr_/i.test(tableName);
-const HIVE_QUERY_TIMEOUT_MS = 15000;
+const HIVE_QUERY_TIMEOUT_MS = parseInt(process.env.HIVE_QUERY_TIMEOUT_MS) || 15000;
 
 const shouldSkipDb = (dbName) => {
   if (['information_schema','sys','_statistics_','starrocks','default','mysql'].includes(dbName)) return true;
@@ -4221,7 +4344,8 @@ const helmet = require('helmet');
 const https = require('https');
 const fs = require('fs');
 const compression = require('compression');
-const rateLimit = require('express-rate-limit');
+const expressRateLimit = require('express-rate-limit');
+const rateLimit = expressRateLimit.rateLimit || expressRateLimit;
 const cookieParser = require('cookie-parser');
 const jwt = require('jsonwebtoken');
 const bcrypt = require('bcrypt');
@@ -4243,12 +4367,25 @@ const lineageRoutes     = require('./routes/lineage');
 // ─── Startup guards ───────────────────────────────────────────────────────────
 const REQUIRED_ENV = ['JWT_SECRET', 'ENCRYPTION_KEY', 'PG_USER', 'PG_HOST',
                       'PG_DATABASE', 'PG_PASSWORD', 'DEFAULT_ADMIN_USER',
-                      'DEFAULT_ADMIN_PASSWORD', 'SSL_KEY_PATH', 'SSL_CERT_PATH'];
+                      'DEFAULT_ADMIN_PASSWORD'];
 const missing = REQUIRED_ENV.filter(k => !process.env[k]);
 if (missing.length) {
     console.error(`[FATAL] Missing required environment variables: ${missing.join(', ')}`);
     process.exit(1);
 }
+
+// Detect HTTPS mode: only enabled when both cert files exist on disk
+const USE_HTTPS = (() => {
+    const k = process.env.SSL_KEY_PATH;
+    const c = process.env.SSL_CERT_PATH;
+    if (!k || !c) return false;
+    try {
+        fs.accessSync(k, fs.constants.R_OK);
+        fs.accessSync(c, fs.constants.R_OK);
+        return true;
+    } catch { return false; }
+})();
+if (!USE_HTTPS) console.warn('[WARN] SSL certs not found — starting in HTTP mode (dev only)');
 
 process.on('uncaughtException',  (err)    => console.error('[CRITICAL] Uncaught exception:',    err.message));
 process.on('unhandledRejection', (reason) => console.error('[CRITICAL] Unhandled rejection:',   reason));
@@ -4320,40 +4457,43 @@ app.use(cors({
 }));
 
 // ─── Rate limiters ────────────────────────────────────────────────────────────
+const RL_WINDOW_MS         = parseInt(process.env.RATE_LIMIT_WINDOW_MS)          || 15 * 60 * 1000;
+const RL_MAX_GENERAL       = parseInt(process.env.RATE_LIMIT_MAX_GENERAL)        || 2000;
+const RL_MAX_AUTH          = parseInt(process.env.RATE_LIMIT_MAX_AUTH)           || 15;
+const RL_MAX_ADMIN         = parseInt(process.env.RATE_LIMIT_MAX_ADMIN)          || 300;
+const RL_MAX_METADATA      = parseInt(process.env.RATE_LIMIT_MAX_METADATA)       || 500;
+const RL_WINDOW_EXPORT_MS  = parseInt(process.env.RATE_LIMIT_WINDOW_EXPORT_MS)   || 60 * 60 * 1000;
+const RL_MAX_EXPORT        = parseInt(process.env.RATE_LIMIT_MAX_EXPORT)         || 5;
+const RL_MAX_DATAWIZZ      = parseInt(process.env.RATE_LIMIT_MAX_DATAWIZZ)       || 10;
+
 app.use('/api/', rateLimit({
-    windowMs: 15 * 60 * 1000,
-    max: 2000,
+    windowMs: RL_WINDOW_MS, max: RL_MAX_GENERAL,
     message: { error: 'Too many requests. Please try again later.' },
     standardHeaders: true, legacyHeaders: false,
 }));
 app.use('/api/auth/', rateLimit({
-    windowMs: 15 * 60 * 1000,
-    max: 15,
+    windowMs: RL_WINDOW_MS, max: RL_MAX_AUTH,
     message: { error: 'Too many login attempts. Please try again in 15 minutes.' },
     standardHeaders: true, legacyHeaders: false,
 }));
 app.use('/api/admin/', rateLimit({
-    windowMs: 15 * 60 * 1000,
-    max: 300,
+    windowMs: RL_WINDOW_MS, max: RL_MAX_ADMIN,
     message: { error: 'Too many admin requests. Please try again later.' },
     standardHeaders: true, legacyHeaders: false,
 }));
 app.use('/api/table-metadata/', rateLimit({
-    windowMs: 15 * 60 * 1000,
-    max: 500,
+    windowMs: RL_WINDOW_MS, max: RL_MAX_METADATA,
     message: { error: 'Too many metadata requests. Please try again later.' },
     standardHeaders: true, legacyHeaders: false,
 }));
-// Strict rate limit for heavy export/build operations (max 5/hour per IP)
+// Strict rate limit for heavy export/build operations
 app.use('/api/explore/export/', rateLimit({
-    windowMs: 60 * 60 * 1000,
-    max: 5,
+    windowMs: RL_WINDOW_EXPORT_MS, max: RL_MAX_EXPORT,
     message: { error: 'Export rate limit exceeded. Please wait before exporting again.' },
     standardHeaders: true, legacyHeaders: false,
 }));
 app.use('/api/datawizz/build', rateLimit({
-    windowMs: 60 * 60 * 1000,
-    max: 10,
+    windowMs: RL_WINDOW_EXPORT_MS, max: RL_MAX_DATAWIZZ,
     message: { error: 'Dashboard build rate limit exceeded. Please wait.' },
     standardHeaders: true, legacyHeaders: false,
 }));
@@ -4363,13 +4503,13 @@ app.use(cookieParser());
 
 // ─── Body parsing ─────────────────────────────────────────────────────────────
 app.use(express.json({
-    limit: '5mb',
+    limit: process.env.EXPRESS_JSON_LIMIT || '5mb',
     verify: (req, _res, buf) => { req.rawBody = buf; },
 }));
 
 // ─── Response size guard (FIX #22) ───────────────────────────────────────────
 // Caps JSON responses at 10 MB to prevent unbounded payload growth
-const MAX_RESPONSE_BYTES = 10 * 1024 * 1024; // 10 MB
+const MAX_RESPONSE_BYTES = parseInt(process.env.MAX_RESPONSE_BYTES) || 10 * 1024 * 1024; // default 10 MB
 app.use((req, res, next) => {
     const _json = res.json.bind(res);
     res.json = function (body) {
@@ -4453,7 +4593,7 @@ app.post('/api/auth/login', async (req, res) => {
 
         const user = rows[0];
         const token = jwt.sign({ username: user.username, role: user.role }, process.env.JWT_SECRET, { expiresIn: '2h', algorithm: 'HS256' });
-        res.cookie('token', token, { httpOnly: true, secure: true, sameSite: 'strict', maxAge: 2 * 60 * 60 * 1000 });
+        res.cookie('token', token, { httpOnly: true, secure: USE_HTTPS, sameSite: 'lax', maxAge: 2 * 60 * 60 * 1000 });
         res.json({ user: { username: user.username, role: user.role } });
     } catch (err) {
         console.error('[Login Error]:', err.message);
@@ -4476,7 +4616,7 @@ app.post('/api/auth/signup', async (req, res) => {
         await pgPool.query('INSERT INTO explorer_users (username, password, role) VALUES ($1,$2,$3)', [username, hashed, 'viewer']);
 
         const token = jwt.sign({ username, role: 'viewer' }, process.env.JWT_SECRET, { expiresIn: '2h', algorithm: 'HS256' });
-        res.cookie('token', token, { httpOnly: true, secure: true, sameSite: 'strict', maxAge: 2 * 60 * 60 * 1000 });
+        res.cookie('token', token, { httpOnly: true, secure: USE_HTTPS, sameSite: 'lax', maxAge: 2 * 60 * 60 * 1000 });
         res.status(201).json({ user: { username, role: 'viewer' } });
     } catch (err) {
         console.error('[Signup Error]:', err.message);
@@ -4542,7 +4682,7 @@ const enforceAuth = (req, res, next) => {
 
 // ─── Logout ───────────────────────────────────────────────────────────────────
 app.post('/api/auth/logout', (req, res) => {
-    res.clearCookie('token', { httpOnly: true, secure: true, sameSite: 'strict' });
+    res.clearCookie('token', { httpOnly: true, secure: USE_HTTPS, sameSite: 'lax' });
     res.json({ success: true });
 });
 
@@ -4564,7 +4704,7 @@ app.post('/api/auth/change-password', enforceAuth, async (req, res) => {
         await pgPool.query('UPDATE explorer_users SET password = $1 WHERE username = $2', [hashed, req.user.username]);
         // Rotate the session cookie after password change
         const newToken = jwt.sign({ username: req.user.username, role: req.user.role }, process.env.JWT_SECRET, { expiresIn: '2h', algorithm: 'HS256' });
-        res.cookie('token', newToken, { httpOnly: true, secure: true, sameSite: 'strict', maxAge: 2 * 60 * 60 * 1000 });
+        res.cookie('token', newToken, { httpOnly: true, secure: USE_HTTPS, sameSite: 'lax', maxAge: 2 * 60 * 60 * 1000 });
         res.json({ success: true });
     } catch (err) {
         console.error('[Change Password Error]:', err.message);
@@ -4590,15 +4730,20 @@ app.use((err, req, res, next) => {
     res.status(500).json({ error: 'Internal Server Error' });
 });
 
-// ─── HTTPS server + graceful shutdown ─────────────────────────────────────────
+// ─── HTTP / HTTPS server + graceful shutdown ──────────────────────────────────
 const PORT = process.env.PORT || 5000;
-const sslOptions = {
-    key:        fs.readFileSync(process.env.SSL_KEY_PATH, 'utf8'),
-    cert:       fs.readFileSync(process.env.SSL_CERT_PATH, 'utf8'),
-    passphrase: process.env.SSL_PASSPHRASE,
-};
 
-const server = https.createServer(sslOptions, app);
+let server;
+if (USE_HTTPS) {
+    const sslOptions = {
+        key:        fs.readFileSync(process.env.SSL_KEY_PATH, 'utf8'),
+        cert:       fs.readFileSync(process.env.SSL_CERT_PATH, 'utf8'),
+        passphrase: process.env.SSL_PASSPHRASE,
+    };
+    server = https.createServer(sslOptions, app);
+} else {
+    server = require('http').createServer(app);
+}
 
 const shutdown = async (signal) => {
     console.log(`[INFO] ${signal} received — starting graceful shutdown...`);
@@ -4617,7 +4762,8 @@ process.on('SIGINT',  () => shutdown('SIGINT'));
 server.listen(PORT, async () => {
     await initDb();
     startCronJobs();
-    console.log(JSON.stringify({ level: 'INFO', timestamp: new Date().toISOString(), message: `Secure backend running on port ${PORT}` }));
+    const proto = USE_HTTPS ? 'HTTPS' : 'HTTP';
+    console.log(JSON.stringify({ level: 'INFO', timestamp: new Date().toISOString(), message: `Backend running on port ${PORT} (${proto})` }));
 });
 
 EOF
@@ -4636,7 +4782,8 @@ cat << 'EOF' > $APP_DIR/frontend/package.json
   "scripts": {
     "dev": "vite --host",
     "build": "vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "start": "vite preview"
   },
   "dependencies": {
     "axios": "^1.6.8",
@@ -4695,12 +4842,19 @@ export default defineConfig(({ mode }) => {
   }
 
   let httpsConfig = false;
-  if (env.VITE_SSL_KEY_PATH && fs.existsSync(env.VITE_SSL_KEY_PATH) && env.VITE_SSL_CERT_PATH && fs.existsSync(env.VITE_SSL_CERT_PATH)) {
-      httpsConfig = { 
-          key: fs.readFileSync(env.VITE_SSL_KEY_PATH), 
-          cert: fs.readFileSync(env.VITE_SSL_CERT_PATH), 
-          passphrase: env.VITE_SSL_PASSPHRASE 
-      };
+  if (env.VITE_SSL_KEY_PATH && env.VITE_SSL_CERT_PATH) {
+      try {
+          fs.accessSync(env.VITE_SSL_KEY_PATH, fs.constants.R_OK);
+          fs.accessSync(env.VITE_SSL_CERT_PATH, fs.constants.R_OK);
+          httpsConfig = {
+              key: fs.readFileSync(env.VITE_SSL_KEY_PATH),
+              cert: fs.readFileSync(env.VITE_SSL_CERT_PATH),
+              passphrase: env.VITE_SSL_PASSPHRASE
+          };
+      } catch (e) {
+          console.warn("SSL certs missing or lack read permissions, falling back to HTTP");
+          httpsConfig = false;
+      }
   }
 
   return {
@@ -4768,14 +4922,21 @@ EOF
 cat << 'EOF' > "$APP_DIR/frontend/src/utils/api.js"
 import axios from 'axios';
 
-// Resolve API base URL from env, replacing hostname at runtime for flexible deploys
-let BASE = import.meta.env.VITE_API_URL || '/api';
-if (BASE.startsWith('http')) {
+// Build API URL dynamically from the current browser's origin so the app works
+// on any IP, hostname, or localhost without changing config.
+// VITE_API_URL provides the backend port (and optional path prefix) — hostname
+// and scheme are always replaced with whatever the browser is currently using.
+let BASE = '/api';
+const _configured = import.meta.env.VITE_API_URL;
+if (_configured) {
     try {
-        const u = new URL(BASE);
-        u.hostname = window.location.hostname;
-        BASE = u.toString().replace(/\/$/, '');
-    } catch(e) {}
+        const _u = new URL(_configured);
+        _u.protocol = window.location.protocol;   // match current scheme (http/https)
+        _u.hostname = window.location.hostname;   // match current host (IP or hostname)
+        BASE = _u.toString().replace(/\/$/, '');
+    } catch (_) {
+        BASE = _configured.replace(/\/$/, '');
+    }
 }
 export const API = BASE;
 
@@ -5397,7 +5558,7 @@ export default function Explore() {
   const [metaForm, setMetaForm] = useState({ description: '', use_case: '', column_comments: {} });
   const [generatingAI, setGeneratingAI] = useState(false);
 
-  const [tableDetails, setTableDetails] = useState({ totalRows: null, tableSize: 'N/A', hudiConfig: null });
+  const [tableDetails, setTableDetails] = useState({ totalRows: null, tableSize: 'N/A', numFiles: 0, hudiConfig: null });
 
   const [mainTab, setMainTab] = useState('schema'); 
   const [obsHistory, setObsHistory] = useState([]);
@@ -5455,7 +5616,7 @@ export default function Explore() {
     setWorkbenchQuery(`SELECT * FROM \`${destinationDb}\`.\`${tName}\` LIMIT 10`);
     
     setLoading(prev => ({ ...prev, schema: true, details: true }));
-    setTableDetails({ totalRows: null, tableSize: 'N/A', hudiConfig: null });
+    setTableDetails({ totalRows: null, tableSize: 'N/A', numFiles: 0, hudiConfig: null });
 
     try {
         const resSchema = await api.post(`${API}/explore/fetch`, { id: selConn.id, type: 'schema', db: destinationDb, table: tName });
@@ -5848,6 +6009,7 @@ export default function Explore() {
                                    <div className="p-4 bg-gray-50 rounded-lg border border-gray-100 flex flex-col justify-center">
                                        <p className="text-[10px] font-bold text-gray-500 uppercase tracking-wider mb-1">Table Size</p>
                                        <p className="text-xl font-black text-gray-800">{tableDetails.tableSize || 'N/A'}</p>
+                                       {tableDetails.numFiles > 0 && <p className="text-xs text-gray-400 mt-1">{tableDetails.numFiles.toLocaleString()} parquet files</p>}
                                    </div>
                                    
                                    {tableDetails.hudiConfig?.isHudi ? (
@@ -6237,6 +6399,10 @@ export default function Sidebar() {
                 </div>
             </div>
             <div className="p-4 space-y-2 flex-1">
+                <button onClick={() => navigate('/')} className="w-full flex items-center gap-2 px-3 py-2 rounded-lg text-xs font-bold text-gray-400 hover:text-indigo-600 hover:bg-white transition-all mb-1 border border-transparent hover:border-gray-200">
+                    <i className="fas fa-arrow-left text-[11px]"></i> All Tools
+                </button>
+                <div className="border-t border-gray-200 mb-2"></div>
                 <button onClick={() => navigate('/home')} className={`w-full flex items-center gap-3 px-4 py-3 rounded-lg font-bold text-sm transition-all ${isActive('/home') ? 'bg-indigo-600 text-white shadow-md shadow-indigo-200' : 'text-gray-600 hover:bg-white hover:text-indigo-600'}`}>
                     <i className="fas fa-home w-5 text-center text-lg"></i> Home
                 </button>
@@ -6727,8 +6893,8 @@ export default function DataWizz() {
         setBuildLogs([]); setBuildStreaming(true); setBuildError(''); setBuildResult(null); setStep(4);
         const body = {
             plan: dashboardPlan, datasetInfo: planDatasetInfo,
-            dataset_name: datasetName, superset_url: supersetUrl,
-            superset_username: supersetUser, superset_password: supersetPass,
+            dataset_name: datasetName, url: supersetUrl,
+            username: supersetUser, password: supersetPass,
             dashboard_id: existingDashboardId ? parseInt(existingDashboardId) : undefined,
         };
         try {
@@ -6738,6 +6904,12 @@ export default function DataWizz() {
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify(body),
             });
+            if (!resp.ok) {
+                const err = await resp.json().catch(() => ({ error: `Server error ${resp.status}` }));
+                setBuildError(err.error || `Server error ${resp.status}`);
+                setBuildStreaming(false);
+                return;
+            }
             const reader = resp.body.getReader();
             const decoder = new TextDecoder();
             let buf = '';
@@ -8905,19 +9077,18 @@ NEW_WEBHOOK_SECRET=$(node -e "process.stdout.write(require('crypto').randomBytes
 # Check and create frontend/.env ONLY if it doesn't exist
 # FIX C5/H5: no real credentials or passphrases in the template — use placeholder tokens
 if [ ! -f "$APP_DIR/frontend/.env" ]; then
-    echo "Creating generic frontend/.env template..."
+    echo "Creating frontend/.env using detected IP: $SERVER_IP"
     cat << EOF > "$APP_DIR/frontend/.env"
-# Point to your secure backend API — update SERVER_HOSTNAME and port as needed
-VITE_API_URL=https://YOUR_SERVER_HOSTNAME:5000/api
+# Backend API URL — auto-detected from server IP (switch to https:// if SSL certs are configured)
+VITE_API_URL=http://${SERVER_IP}:5000/api
 
 # Comma-separated list of hostnames allowed to serve the frontend
-VITE_ALLOWED_HOSTS=YOUR_SERVER_HOSTNAME
+VITE_ALLOWED_HOSTS=${SERVER_IP}
 
-# Paths to your TLS certificate files
-VITE_SSL_KEY_PATH=/path/to/privkey.pem
-VITE_SSL_CERT_PATH=/path/to/fullchain.pem
-# Set your actual SSL passphrase here — do NOT commit this file to version control
-VITE_SSL_PASSPHRASE=CHANGE_ME
+# Paths to your TLS certificate files — leave blank to run in HTTP mode (dev)
+VITE_SSL_KEY_PATH=
+VITE_SSL_CERT_PATH=
+VITE_SSL_PASSPHRASE=
 EOF
 else
     echo "✅ frontend/.env already exists. Preserving your configuration."
@@ -8926,12 +9097,14 @@ fi
 # Check and create backend/.env ONLY if it doesn't exist
 # FIX C5/H4/H5: generate unique random secrets per install, no real credentials in template
 if [ ! -f "$APP_DIR/backend/.env" ]; then
-    echo "Creating generic backend/.env template..."
+    echo "Creating backend/.env using detected IP: $SERVER_IP"
+    # Generate a valid default admin password (meets complexity: upper+lower+digit+special, 16 chars)
+    NEW_ADMIN_PASSWORD="Admin@$(node -e "process.stdout.write(require('crypto').randomBytes(6).toString('hex'))")1"
     cat << EOF > "$APP_DIR/backend/.env"
 # Server Configuration
 PORT=5000
-FRONTEND_URL=https://YOUR_SERVER_HOSTNAME:5173
-ALLOWED_CORS_ORIGINS=https://YOUR_SERVER_HOSTNAME:5173,https://YOUR_SERVER_HOSTNAME:4173
+FRONTEND_URL=http://${SERVER_IP}:4173
+ALLOWED_CORS_ORIGINS=http://${SERVER_IP}:5173,http://${SERVER_IP}:4173
 
 # PostgreSQL Database Credentials — fill in your actual values
 PG_USER=CHANGE_ME
@@ -8948,22 +9121,61 @@ LLM_MODEL=gpt-4o-mini
 # AES-256 Encryption Key — auto-generated unique value for this install (64 hex chars)
 ENCRYPTION_KEY=${NEW_ENCRYPTION_KEY}
 
-# Paths to your TLS certificate files
-SSL_KEY_PATH=/path/to/privkey.pem
-SSL_CERT_PATH=/path/to/fullchain.pem
-# Set your actual SSL passphrase here — do NOT commit this file to version control
-SSL_PASSPHRASE=CHANGE_ME
+# Paths to your TLS certificate files — leave blank to run in HTTP mode (dev)
+# Fill in real cert paths to enable HTTPS in production
+SSL_KEY_PATH=
+SSL_CERT_PATH=
+SSL_PASSPHRASE=
 
 # Authentication Secrets — auto-generated unique values for this install
 JWT_SECRET=${NEW_JWT_SECRET}
 DEFAULT_ADMIN_USER=admin
-# Change this after first login
-DEFAULT_ADMIN_PASSWORD=CHANGE_ME_ON_FIRST_LOGIN
+# Auto-generated password — change this after first login
+DEFAULT_ADMIN_PASSWORD=${NEW_ADMIN_PASSWORD}
 
 # Default fallback credentials for Hive & StarRocks connections (set to your actual cluster defaults)
 HIVE_DEFAULT_USER=hadoop
 HIVE_DEFAULT_PASSWORD=
 SR_DEFAULT_USER=root
+SR_FE_PORT=9030
+
+# PostgreSQL connection pool tuning
+PG_POOL_MAX=10
+PG_IDLE_TIMEOUT_MS=30000
+PG_CONNECT_TIMEOUT_MS=5000
+
+# MySQL / StarRocks connection timeout (ms)
+MYSQL_CONNECT_TIMEOUT_MS=15000
+
+# Hive client timeouts and cache (ms)
+HIVE_CONNECT_TIMEOUT_MS=20000
+HIVE_QUERY_TIMEOUT_MS=30000
+HIVE_CACHE_TTL_MS=300000
+HIVE_CACHE_MAX_KEYS=500
+HIVE_CACHE_CLEANUP_INTERVAL_MS=600000
+
+# Export limits
+EXPORT_ROW_LIMIT=50000
+EXPORT_TIMEOUT_MS=120000
+
+# HTTP body / response size limits
+EXPRESS_JSON_LIMIT=5mb
+MAX_RESPONSE_BYTES=10485760
+
+# Rate limiting
+RATE_LIMIT_WINDOW_MS=900000
+RATE_LIMIT_MAX_GENERAL=2000
+RATE_LIMIT_MAX_AUTH=15
+RATE_LIMIT_MAX_ADMIN=300
+RATE_LIMIT_MAX_METADATA=500
+RATE_LIMIT_WINDOW_EXPORT_MS=3600000
+RATE_LIMIT_MAX_EXPORT=5
+RATE_LIMIT_MAX_DATAWIZZ=10
+
+# WebHDFS configuration — for fetching HDFS table size via WebHDFS REST API
+HDFS_WEBHDFS_PORT=9871
+HDFS_WEBHDFS_PROTOCOL=https
+HDFS_WEBHDFS_USER=hadoop
 
 # Webhook shared secret — callers must send this as X-Webhook-Secret header
 WEBHOOK_SECRET=${NEW_WEBHOOK_SECRET}
@@ -9047,6 +9259,33 @@ fi
 # ==========================================
 echo ""
 echo "Launching Data Explorer with PM2..."
+
+# Write ecosystem.config.js so PM2 knows how to start both processes
+cat << 'EOF' > "$APP_DIR/ecosystem.config.js"
+module.exports = {
+  apps: [
+    {
+      name: 'data-explorer-backend',
+      script: 'server.js',
+      cwd: '/opt/data-explorer-app/backend',
+      instances: 1,
+      autorestart: true,
+      watch: false,
+      env: { NODE_ENV: 'production' }
+    },
+    {
+      name: 'data-explorer-frontend',
+      script: 'npm',
+      args: 'run preview',
+      cwd: '/opt/data-explorer-app/frontend',
+      instances: 1,
+      autorestart: true,
+      watch: false,
+      env: { NODE_ENV: 'production' }
+    }
+  ]
+};
+EOF
 
 # Stop existing instances cleanly if running
 pm2 stop ecosystem.config.js --silent 2>/dev/null || true

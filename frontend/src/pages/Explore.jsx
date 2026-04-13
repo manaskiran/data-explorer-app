@@ -32,7 +32,7 @@ export default function Explore() {
   const [metaForm, setMetaForm] = useState({ description: '', use_case: '', column_comments: {} });
   const [generatingAI, setGeneratingAI] = useState(false);
 
-  const [tableDetails, setTableDetails] = useState({ totalRows: null, tableSize: 'N/A', hudiConfig: null });
+  const [tableDetails, setTableDetails] = useState({ totalRows: null, tableSize: 'N/A', numFiles: 0, hudiConfig: null });
 
   const [mainTab, setMainTab] = useState('schema'); 
   const [obsHistory, setObsHistory] = useState([]);
@@ -90,7 +90,7 @@ export default function Explore() {
     setWorkbenchQuery(`SELECT * FROM \`${destinationDb}\`.\`${tName}\` LIMIT 10`);
     
     setLoading(prev => ({ ...prev, schema: true, details: true }));
-    setTableDetails({ totalRows: null, tableSize: 'N/A', hudiConfig: null });
+    setTableDetails({ totalRows: null, tableSize: 'N/A', numFiles: 0, hudiConfig: null });
 
     try {
         const resSchema = await api.post(`${API}/explore/fetch`, { id: selConn.id, type: 'schema', db: destinationDb, table: tName });
@@ -483,6 +483,7 @@ export default function Explore() {
                                    <div className="p-4 bg-gray-50 rounded-lg border border-gray-100 flex flex-col justify-center">
                                        <p className="text-[10px] font-bold text-gray-500 uppercase tracking-wider mb-1">Table Size</p>
                                        <p className="text-xl font-black text-gray-800">{tableDetails.tableSize || 'N/A'}</p>
+                                       {tableDetails.numFiles > 0 && <p className="text-xs text-gray-400 mt-1">{tableDetails.numFiles.toLocaleString()} parquet files</p>}
                                    </div>
                                    
                                    {tableDetails.hudiConfig?.isHudi ? (

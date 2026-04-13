@@ -33,7 +33,7 @@ const shouldSkipDb = (dbName) => {
 const isValidIdentifier = (name) => typeof name === 'string' && /^[a-zA-Z0-9_\-]+$/.test(name);
 
 const getSrConn = async (host, port, user, password) => {
-    const c = await mysql.createConnection({ host, port: Number(port), user: user || 'root', password: password || '', connectTimeout: 15000 });
+    const c = await mysql.createConnection({ host, port: Number(port), user: user || process.env.SR_DEFAULT_USER || 'root', password: password || '', connectTimeout: parseInt(process.env.MYSQL_CONNECT_TIMEOUT_MS) || 15000 });
     try { await c.query('SET new_planner_optimize_timeout = 300000;'); } catch (e) {}
     try { await c.query('SET query_timeout = 300;'); } catch (e) {}
     return c;

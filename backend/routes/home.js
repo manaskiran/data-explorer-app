@@ -103,8 +103,8 @@ router.get('/stats', async (req, res) => {
                 return;
             }
 
-            const srPort     = conn.type === 'starrocks' ? conn.port : 9030;
-            const srUser     = conn.type === 'starrocks' ? conn.username : (conn.sr_username || 'root');
+            const srPort     = conn.type === 'starrocks' ? conn.port : (parseInt(process.env.SR_FE_PORT) || 9030);
+            const srUser     = conn.type === 'starrocks' ? conn.username : (conn.sr_username || process.env.SR_DEFAULT_USER || 'root');
             const srPassword = conn.type === 'starrocks' ? decrypt(conn.password) : (decrypt(conn.sr_password) || '');
             const catalog    = conn.type === 'hive' ? 'hudi_catalog' : 'default_catalog';
 
@@ -112,7 +112,7 @@ router.get('/stats', async (req, res) => {
             try {
                 pool = mysql.createPool({
                     host: conn.host, port: srPort, user: srUser, password: srPassword,
-                    connectionLimit: 5, connectTimeout: 5000
+                    connectionLimit: 5, connectTimeout: parseInt(process.env.MYSQL_CONNECT_TIMEOUT_MS) || 5000
                 });
 
                 // FIX #15: single query per connection (not per-database)
@@ -189,8 +189,8 @@ router.post('/global-search', async (req, res) => {
                 return;
             }
 
-            const srPort     = conn.type === 'starrocks' ? conn.port : 9030;
-            const srUser     = conn.type === 'starrocks' ? conn.username : (conn.sr_username || 'root');
+            const srPort     = conn.type === 'starrocks' ? conn.port : (parseInt(process.env.SR_FE_PORT) || 9030);
+            const srUser     = conn.type === 'starrocks' ? conn.username : (conn.sr_username || process.env.SR_DEFAULT_USER || 'root');
             const srPassword = conn.type === 'starrocks' ? decrypt(conn.password) : (decrypt(conn.sr_password) || '');
             const catalog    = conn.type === 'hive' ? 'hudi_catalog' : 'default_catalog';
 

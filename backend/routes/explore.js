@@ -1,9 +1,24 @@
 const express = require('express'); const router = express.Router(); const mysql = require('mysql2/promise'); const excel = require('exceljs'); const hive = require('hive-driver'); const { TCLIService, TCLIService_types } = hive.thrift; const { pgPool } = require('../db'); const { decrypt } = require('../utils/crypto');
+const http = require('http'); const https = require('https');
+const fetchWebHDFS = (url) => new Promise((resolve, reject) => {
+    const lib = url.startsWith('https') ? https : http;
+    const options = url.startsWith('https') ? { rejectUnauthorized: false } : {};
+    const req = lib.get(url, options, (res) => {
+        if (res.statusCode === 307 && res.headers.location) {
+            return fetchWebHDFS(res.headers.location).then(resolve).catch(reject);
+        }
+        let data = '';
+        res.on('data', chunk => data += chunk);
+        res.on('end', () => { try { resolve(JSON.parse(data)); } catch(e) { reject(e); } });
+    });
+    req.setTimeout(8000, () => { req.destroy(); reject(new Error('WebHDFS timeout')); });
+    req.on('error', reject);
+});
 const { maskDataPreview } = require('../utils/masking');
 const { requireConnectionAccess } = require('../middleware/access');
 const globalHiveCache = {};
-const HIVE_CACHE_TTL_MS  = 5 * 60 * 1000;
-const HIVE_CACHE_MAX_KEYS = 500;
+const HIVE_CACHE_TTL_MS   = parseInt(process.env.HIVE_CACHE_TTL_MS)    || 5 * 60 * 1000;
+const HIVE_CACHE_MAX_KEYS = parseInt(process.env.HIVE_CACHE_MAX_KEYS)  || 500;
 setInterval(() => {
     const now = Date.now();
     for (const connId of Object.keys(globalHiveCache)) {
@@ -15,7 +30,7 @@ setInterval(() => {
         }
         if (Object.keys(bucket).length === 0) delete globalHiveCache[connId];
     }
-}, 10 * 60 * 1000).unref();
+}, parseInt(process.env.HIVE_CACHE_CLEANUP_INTERVAL_MS) || 10 * 60 * 1000).unref();
 function hiveCacheEvict(bucket) {
     const tsKeys = Object.keys(bucket).filter(k => k.endsWith('__ts'));
     if (tsKeys.length < HIVE_CACHE_MAX_KEYS) return;
@@ -25,8 +40,8 @@ function hiveCacheEvict(bucket) {
 }
 const isValidIdentifier = (name) => typeof name === 'string' && /^[a-zA-Z0-9_\-]+$/.test(name);
 
-const HIVE_CONNECT_TIMEOUT_MS = 20000;
-const HIVE_QUERY_TIMEOUT_MS   = 30000;
+const HIVE_CONNECT_TIMEOUT_MS = parseInt(process.env.HIVE_CONNECT_TIMEOUT_MS) || 20000;
+const HIVE_QUERY_TIMEOUT_MS   = parseInt(process.env.HIVE_QUERY_TIMEOUT_MS)   || 30000;
 
 const withTimeout = (promise, ms, label) =>
     Promise.race([
@@ -101,7 +116,7 @@ router.post('/explore/fetch', requireConnectionAccess('id'), async (req, res) =>
             } finally { await connection.end(); }
         } else if (conn.type === 'hive') {
             // All Hive operations go through StarRocks MySQL (hudi_catalog) — direct Hive TCP is not used
-            const connection = await getSrConnection(conn.host, 9030, conn.sr_username || process.env.SR_DEFAULT_USER || 'root', decrypt(conn.sr_password) || '');
+            const connection = await getSrConnection(conn.host, parseInt(process.env.SR_FE_PORT) || 9030, conn.sr_username || process.env.SR_DEFAULT_USER || 'root', decrypt(conn.sr_password) || '');
             try {
                 await connection.query('SET CATALOG hudi_catalog;');
                 if (type === 'databases') {
@@ -126,32 +141,63 @@ router.post('/search/fetch', requireConnectionAccess('id'), async (req, res) => 
         const conn = rows[0]; conn.password = decrypt(conn.password); conn.sr_password = decrypt(conn.sr_password);
         if (conn.type === 'starrocks') { const connection = await getSrConnection(conn.host, conn.port, conn.username, conn.password); const [result] = await connection.query(`SELECT TABLE_SCHEMA as db, TABLE_NAME as tbl, COLUMN_NAME as col FROM information_schema.columns WHERE COLUMN_NAME LIKE ? LIMIT 100`, [`%${col}%`]); await connection.end(); res.json(result); } 
         else if (conn.type === 'hive') {
-            // Use StarRocks MySQL bridge (hudi_catalog) — same approach as /explore/fetch.
-            // Direct Hive TCP (port 10000) is unreliable and always times out.
-            const connection = await getSrConnection(
-                conn.host, 9030,
-                conn.sr_username || process.env.SR_DEFAULT_USER || 'root',
-                decrypt(conn.sr_password) || ''
-            );
+            if (!globalHiveCache[id]) globalHiveCache[id] = {};
+            const myCache = globalHiveCache[id];
+            hiveCacheEvict(myCache);
+            const setup = await setupHiveClient(conn);
             try {
-                await connection.query('SET CATALOG hudi_catalog;');
-                const [result] = await connection.query(
-                    `SELECT TABLE_SCHEMA AS db, TABLE_NAME AS tbl, COLUMN_NAME AS col
-                     FROM information_schema.columns
-                     WHERE COLUMN_NAME LIKE ?
-                       AND TABLE_SCHEMA NOT IN ('information_schema', 'sys', 'hudi_metadata')
-                     LIMIT 100`,
-                    [`%${col}%`]
-                );
-                res.json(result);
-            } finally { await connection.end(); }
+                let results = [];
+                const startTime = Date.now();
+                let timeLimitHit = false;
+                const safeQuery = async (q, t) => withTimeout(setup.executeQuery(q), t, q.slice(0, 40));
+                const dbRows = await safeQuery('SHOW DATABASES', 15000);
+                const dbs = (dbRows || []).map(r => Object.values(r)[0]).filter(d => d && d !== 'information_schema' && d !== 'sys' && d !== 'hudi_metadata');
+                for (let i = 0; i < dbs.length; i++) {
+                    if (timeLimitHit) break;
+                    try {
+                        const tableRows = await safeQuery(`SHOW TABLES IN \`${dbs[i]}\``, 10000);
+                        const tables = (tableRows || []).map(r => Object.values(r)[Object.values(r).length - 1]);
+                        for (let j = 0; j < tables.length; j += 10) {
+                            if (Date.now() - startTime > 55000 || results.length >= 100) { timeLimitHit = true; break; }
+                            await Promise.all(tables.slice(j, j + 10).map(async (tName) => {
+                                const cacheKey = `${dbs[i]}.${tName}`;
+                                let columns = myCache[cacheKey];
+                                const cacheTs = myCache[`${cacheKey}__ts`];
+                                if (!columns || (cacheTs && Date.now() - cacheTs > HIVE_CACHE_TTL_MS)) {
+                                    try {
+                                        const schema = await safeQuery(`DESCRIBE \`${dbs[i]}\`.\`${tName}\``, 6000);
+                                        if (schema && schema.length > 0) {
+                                            columns = schema.filter(r => r.col_name).map(r => r.col_name);
+                                            myCache[cacheKey] = columns;
+                                            myCache[`${cacheKey}__ts`] = Date.now();
+                                        } else { columns = []; }
+                                    } catch (e) {
+                                        console.warn(`[HiveCache] DESCRIBE failed for ${cacheKey}:`, e.message);
+                                        columns = [];
+                                    }
+                                }
+                                for (const c of columns) {
+                                    if (c.toLowerCase().includes(col.toLowerCase()))
+                                        results.push({ db: dbs[i], tbl: tName, col: c });
+                                }
+                            }));
+                        }
+                    } catch (e) { console.warn(`[HiveSearch] DB ${dbs[i]} error:`, e.message); }
+                }
+                res.json(results);
+            } catch (e) {
+                res.status(500).json({ error: 'Hive cluster disconnected or timed out.' });
+            } finally {
+                try { if (setup.session) await setup.session.close(); } catch (e) {}
+                try { if (setup.client) await setup.client.close(); } catch (e) {}
+            }
         }
     } catch (e) { console.error("[Search Fetch Error]:", e); res.status(500).json({ error: "Failed to perform global search." }); }
 });
 
 router.post('/export/fetch', requireConnectionAccess('id'), async (req, res) => {
-    const EXPORT_ROW_LIMIT  = 50000;
-    const EXPORT_TIMEOUT_MS = 120000;
+    const EXPORT_ROW_LIMIT  = parseInt(process.env.EXPORT_ROW_LIMIT)  || 50000;
+    const EXPORT_TIMEOUT_MS = parseInt(process.env.EXPORT_TIMEOUT_MS) || 120000;
     req.setTimeout(EXPORT_TIMEOUT_MS); 
     try {
         const { rows } = await pgPool.query('SELECT * FROM explorer_connections WHERE id = $1', [req.body.id]); if (!rows.length) return res.status(404).json({ error: 'Connection not found' });
@@ -170,14 +216,16 @@ router.post('/export/fetch', requireConnectionAccess('id'), async (req, res) => 
                 const [cols] = await connection.query(`SELECT TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME, DATA_TYPE, COLUMN_COMMENT FROM information_schema.columns WHERE TABLE_SCHEMA = ? ORDER BY TABLE_NAME, ORDINAL_POSITION LIMIT ${EXPORT_ROW_LIMIT}`, [req.body.db]);
                 cols.forEach(c => { const overrideComment = dbMeta[c.TABLE_NAME]?.[c.COLUMN_NAME]; worksheet.addRow({ db: c.TABLE_SCHEMA, table: c.TABLE_NAME, column: c.COLUMN_NAME, type: c.DATA_TYPE, comment: overrideComment || c.COLUMN_COMMENT || '' }); });
             } finally { await connection.end(); }
-        } else {
-            let setup = await setupHiveClient(conn);
+        } else if (conn.type === 'hive') {
+            const connection = await getSrConnection(conn.host, parseInt(process.env.SR_FE_PORT) || 9030, conn.sr_username || process.env.SR_DEFAULT_USER || 'root', decrypt(conn.sr_password) || '');
             try {
-                // isValidIdentifier already enforced above; use backtick quoting for Hive identifier safety
-                const safeDb = req.body.db.replace(/`/g, '');
-                const allCols = await Promise.race([ setup.executeQuery(`SELECT table_name, column_name, data_type, comment FROM information_schema.columns WHERE table_schema = \`${safeDb}\` LIMIT ${EXPORT_ROW_LIMIT}`), new Promise((_, r) => setTimeout(() => r(new Error("FAST_TIMEOUT")), 15000)) ]);
-                if (allCols && allCols.length > 0) { allCols.forEach(r => { const override = dbMeta[Object.values(r)[0]]?.[Object.values(r)[1]]; worksheet.addRow({ db: req.body.db, table: Object.values(r)[0], column: Object.values(r)[1], type: Object.values(r)[2] || '', comment: override || Object.values(r)[3] || '' }); }); }
-            } catch (err) { console.warn('[Export] Hive info_schema query failed:', err.message); } finally { try{if(setup.session) await setup.session.close();}catch(e){ console.warn('[Export] Hive session close failed:', e.message); } try{if(setup.client) await setup.client.close();}catch(e){ console.warn('[Export] Hive client close failed:', e.message); } }
+                await connection.query('SET CATALOG hudi_catalog;');
+                const [cols] = await connection.query(
+                    `SELECT TABLE_NAME, COLUMN_NAME, DATA_TYPE, COLUMN_COMMENT FROM information_schema.columns WHERE TABLE_SCHEMA = ? ORDER BY TABLE_NAME, ORDINAL_POSITION LIMIT ${EXPORT_ROW_LIMIT}`,
+                    [req.body.db]
+                );
+                cols.forEach(c => { const overrideComment = dbMeta[c.TABLE_NAME]?.[c.COLUMN_NAME]; worksheet.addRow({ db: req.body.db, table: c.TABLE_NAME, column: c.COLUMN_NAME, type: c.DATA_TYPE, comment: overrideComment || c.COLUMN_COMMENT || '' }); });
+            } finally { await connection.end(); }
         }
         res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'); res.setHeader('Content-Disposition', `attachment; filename="${encodeURIComponent(req.body.db)}_data_dictionary.xlsx"`);
         await workbook.xlsx.write(res); res.end();
@@ -189,7 +237,7 @@ router.post('/explore/preview', requireConnectionAccess('connection_id'), async 
         const { connection_id, db_name, table_name } = req.body; const { rows } = await pgPool.query('SELECT * FROM explorer_connections WHERE id = $1', [connection_id]); if (!rows.length) return res.status(404).json({ error: 'Connection not found' });
         if (!isValidIdentifier(db_name) || !isValidIdentifier(table_name)) return res.status(400).json({ error: "Invalid identifiers" });
         const conn = rows[0]; let sampleData = [];
-        const connection = await getSrConnection(conn.host, conn.type === 'starrocks' ? conn.port : 9030, conn.type === 'starrocks' ? conn.username : (conn.sr_username || 'root'), conn.type === 'starrocks' ? decrypt(conn.password) : (decrypt(conn.sr_password) || ''));
+        const connection = await getSrConnection(conn.host, conn.type === 'starrocks' ? conn.port : (parseInt(process.env.SR_FE_PORT) || 9030), conn.type === 'starrocks' ? conn.username : (conn.sr_username || process.env.SR_DEFAULT_USER || 'root'), conn.type === 'starrocks' ? decrypt(conn.password) : (decrypt(conn.sr_password) || ''));
         try { if (conn.type === 'hive') await connection.query('SET CATALOG hudi_catalog;'); const [dataRows] = await connection.query(`SELECT * FROM \`${db_name}\`.\`${table_name}\` LIMIT 50`); sampleData = dataRows; } catch (dataErr) { return res.status(500).json({ error: "Could not read data sample" }); } finally { await connection.end(); }
         
         const maskedSample = sampleData.map(row => {
@@ -205,7 +253,7 @@ router.post('/explore/profile-column', requireConnectionAccess('connection_id'),
         const { connection_id, db_name, table_name, column_name } = req.body; if (!isValidIdentifier(db_name) || !isValidIdentifier(table_name) || !isValidIdentifier(column_name)) return res.status(400).json({ error: "Invalid identifiers" });
         const { rows } = await pgPool.query('SELECT * FROM explorer_connections WHERE id = $1', [connection_id]); if (!rows.length) return res.status(404).json({ error: 'Connection not found' });
         const conn = rows[0];
-        const connection = await getSrConnection(conn.host, conn.type === 'starrocks' ? conn.port : 9030, conn.type === 'starrocks' ? conn.username : (conn.sr_username || 'root'), conn.type === 'starrocks' ? decrypt(conn.password) : (decrypt(conn.sr_password) || ''));
+        const connection = await getSrConnection(conn.host, conn.type === 'starrocks' ? conn.port : (parseInt(process.env.SR_FE_PORT) || 9030), conn.type === 'starrocks' ? conn.username : (conn.sr_username || process.env.SR_DEFAULT_USER || 'root'), conn.type === 'starrocks' ? decrypt(conn.password) : (decrypt(conn.sr_password) || ''));
         try {
             if (conn.type === 'hive') await connection.query('SET CATALOG hudi_catalog;');
             const [stats] = await connection.query(`SELECT COUNT(*) as total_rows, COUNT(DISTINCT \`${column_name}\`) as distinct_count, SUM(CASE WHEN \`${column_name}\` IS NULL THEN 1 ELSE 0 END) as null_count, MIN(CAST(\`${column_name}\` AS VARCHAR)) as min_val, MAX(CAST(\`${column_name}\` AS VARCHAR)) as max_val FROM \`${db_name}\`.\`${table_name}\``);
@@ -233,7 +281,7 @@ router.post('/explore/query', requireConnectionAccess('connection_id'), async (r
         }
 
         let results = [];
-        const connection = await getSrConnection(conn.host, conn.type === 'starrocks' ? conn.port : 9030, conn.type === 'starrocks' ? conn.username : (conn.sr_username || 'root'), conn.type === 'starrocks' ? decrypt(conn.password) : (decrypt(conn.sr_password) || ''));
+        const connection = await getSrConnection(conn.host, conn.type === 'starrocks' ? conn.port : (parseInt(process.env.SR_FE_PORT) || 9030), conn.type === 'starrocks' ? conn.username : (conn.sr_username || process.env.SR_DEFAULT_USER || 'root'), conn.type === 'starrocks' ? decrypt(conn.password) : (decrypt(conn.sr_password) || ''));
         
         // FIX #17: inject LIMIT if query has none, cap at 500 rows fetched from DB
         const hasLimit = /\bLIMIT\s+\d+/i.test(safeQuery);
@@ -261,10 +309,11 @@ router.post('/explore/table-details', requireConnectionAccess('connection_id'), 
         if (!rows.length) return res.status(404).json({ error: 'Connection not found' });
         
         const conn = rows[0];
-        const connection = await getSrConnection(conn.host, conn.type === 'starrocks' ? conn.port : 9030, conn.type === 'starrocks' ? conn.username : (conn.sr_username || 'root'), conn.type === 'starrocks' ? decrypt(conn.password) : (decrypt(conn.sr_password) || ''));
+        const connection = await getSrConnection(conn.host, conn.type === 'starrocks' ? conn.port : (parseInt(process.env.SR_FE_PORT) || 9030), conn.type === 'starrocks' ? conn.username : (conn.sr_username || process.env.SR_DEFAULT_USER || 'root'), conn.type === 'starrocks' ? decrypt(conn.password) : (decrypt(conn.sr_password) || ''));
 
         let totalRows = 0;
         let tableSize = 'N/A';
+        let numFiles = 0;
         let hudiConfig = { isHudi: false, tableType: 'N/A', recordKeys: 'N/A', precombineKey: 'N/A', partitionFields: 'N/A' };
 
         const formatBytes = (bytes) => {
@@ -294,47 +343,70 @@ router.post('/explore/table-details', requireConnectionAccess('connection_id'), 
                 } catch(e) { console.warn('[TableDetails] Size fetch (StarRocks) failed:', e.message); }
             } else if (conn.type === 'hive') {
                 try {
-                    let setup = await setupHiveClient(conn);
-                    const descRows = await Promise.race([
-                        setup.executeQuery(`DESCRIBE FORMATTED \`${db_name}\`.\`${table_name}\``),
-                        new Promise((_, r) => setTimeout(() => r(new Error("TIMEOUT")), 10000))
-                    ]);
-                    
-                    for (let row of descRows) {
-                        let vals = Object.values(row).map(v => String(v || '').trim());
-                        let idx = vals.indexOf('totalSize');
-                        if (idx !== -1 && vals[idx + 1]) {
-                            const bytes = parseInt(vals[idx + 1]);
-                            if (!isNaN(bytes) && bytes > 0) {
-                                tableSize = formatBytes(bytes);
-                            }
-                            break;
+                    // Use the already-open StarRocks connection (SET CATALOG hudi_catalog already applied above)
+                    const [statusRes] = await connection.query(
+                        `SHOW TABLE STATUS FROM \`${db_name}\` LIKE ?`, [table_name]
+                    );
+                    if (statusRes && statusRes.length > 0) {
+                        const dataLen = parseInt(statusRes[0].Data_length || 0);
+                        if (dataLen > 0) {
+                            tableSize = formatBytes(dataLen);
+                        } else {
+                            try {
+                                const [infoRes] = await connection.query(
+                                    `SELECT DATA_LENGTH, TABLE_ROWS FROM information_schema.tables WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?`,
+                                    [db_name, table_name]
+                                );
+                                if (infoRes && infoRes.length > 0 && parseInt(infoRes[0].DATA_LENGTH) > 0) {
+                                    tableSize = formatBytes(parseInt(infoRes[0].DATA_LENGTH));
+                                }
+                            } catch(e2) { /* keep N/A */ }
                         }
                     }
-                    try{if(setup.session) await setup.session.close();}catch(e){} 
-                    try{if(setup.client) await setup.client.close();}catch(e){}
-                } catch(e) { console.error("Hive size fetch error:", e.message); }
+                } catch(e) { console.warn('[TableDetails] Hive size fetch failed:', e.message); }
             }
 
-            // 3. Parse Hudi Configurations from DDL
+            // 3. Parse Hudi Configurations from DDL + extract HDFS location for size
             if (conn.type === 'hive' || conn.type === 'starrocks') {
                 try {
                     const [createRes] = await connection.query(`SHOW CREATE TABLE \`${db_name}\`.\`${table_name}\``);
                     const createStmt = Object.values(createRes[0])[1] || '';
-                    
+
                     if (createStmt.toLowerCase().includes('hudi') || createStmt.includes('_hoodie_')) {
                         hudiConfig.isHudi = true;
-                        
+
                         const parseProp = (str, prop) => {
                             const regex = new RegExp(`['"]${prop}['"]\\s*=\\s*['"]([^'"]+)['"]`, 'i');
                             const match = str.match(regex);
                             return match ? match[1] : 'N/A';
                         };
-                        
+
                         hudiConfig.tableType = parseProp(createStmt, 'hoodie.table.type') !== 'N/A' ? parseProp(createStmt, 'hoodie.table.type') : 'COPY_ON_WRITE';
                         hudiConfig.recordKeys = parseProp(createStmt, 'hoodie.datasource.write.recordkey.field') !== 'N/A' ? parseProp(createStmt, 'hoodie.datasource.write.recordkey.field') : parseProp(createStmt, 'primaryKey');
                         hudiConfig.precombineKey = parseProp(createStmt, 'hoodie.datasource.write.precombine.field');
                         hudiConfig.partitionFields = parseProp(createStmt, 'hoodie.datasource.write.partitionpath.field');
+
+                        // Extract HDFS location and fetch real size + file count via WebHDFS
+                        if (conn.type === 'hive' && tableSize === 'N/A') {
+                            const locationMatch = createStmt.match(/"location"\s*=\s*"(hdfs:\/\/[^"]+)"/i);
+                            if (locationMatch) {
+                                try {
+                                    const hdfsUri = locationMatch[1];
+                                    const nnHost = (hdfsUri.match(/hdfs:\/\/([^:/]+)/) || [])[1];
+                                    const hdfsPath = hdfsUri.replace(/^hdfs:\/\/[^/]+/, '');
+                                    const webhdfsPort = parseInt(process.env.HDFS_WEBHDFS_PORT) || 9870;
+                                    const webhdfsUser = process.env.HDFS_WEBHDFS_USER || 'hadoop';
+                                    const webhdfsProto = process.env.HDFS_WEBHDFS_PROTOCOL || 'http';
+                                    const webhdfsUrl = `${webhdfsProto}://${nnHost}:${webhdfsPort}/webhdfs/v1${hdfsPath}?op=GETCONTENTSUMMARY&user.name=${webhdfsUser}`;
+                                    const result = await fetchWebHDFS(webhdfsUrl);
+                                    if (result && result.ContentSummary) {
+                                        const { length, fileCount } = result.ContentSummary;
+                                        if (length > 0) tableSize = formatBytes(length);
+                                        numFiles = fileCount || 0;
+                                    }
+                                } catch(e) { console.warn('[TableDetails] WebHDFS size fetch failed:', e.message); }
+                            }
+                        }
                     }
                 } catch(e) { console.warn('[TableDetails] DDL/Hudi parse failed:', e.message); }
             }
@@ -342,7 +414,7 @@ router.post('/explore/table-details', requireConnectionAccess('connection_id'), 
             await connection.end();
         }
 
-        res.json({ totalRows, tableSize, hudiConfig });
+        res.json({ totalRows, tableSize, numFiles, hudiConfig });
     } catch (e) {
         console.error("[Table Details Error]:", e);
         res.status(500).json({ error: "Failed to fetch table details." });
@@ -350,4 +422,3 @@ router.post('/explore/table-details', requireConnectionAccess('connection_id'), 
 });
 
 module.exports = router;
-

@@ -14,8 +14,8 @@ async function runGlobalObservabilityScan() {
                 if (conn.type === 'airflow') continue;
 
                 console.log(`\n[CRON] Scanning Connection: ${conn.name} (${conn.type})`);
-                const srHost = conn.host; const srPort = conn.type === 'starrocks' ? conn.port : 9030;
-                const srUser = conn.type === 'starrocks' ? conn.username : (conn.sr_username || 'root');
+                const srHost = conn.host; const srPort = conn.type === 'starrocks' ? conn.port : (parseInt(process.env.SR_FE_PORT) || 9030);
+                const srUser = conn.type === 'starrocks' ? conn.username : (conn.sr_username || process.env.SR_DEFAULT_USER || 'root');
                 const srPassword = conn.type === 'starrocks' ? decrypt(conn.password) : (decrypt(conn.sr_password) || '');
                 let mysqlConn;
                 try {

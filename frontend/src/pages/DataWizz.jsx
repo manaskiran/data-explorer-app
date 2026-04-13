@@ -323,8 +323,8 @@ export default function DataWizz() {
         setBuildLogs([]); setBuildStreaming(true); setBuildError(''); setBuildResult(null); setStep(4);
         const body = {
             plan: dashboardPlan, datasetInfo: planDatasetInfo,
-            dataset_name: datasetName, superset_url: supersetUrl,
-            superset_username: supersetUser, superset_password: supersetPass,
+            dataset_name: datasetName, url: supersetUrl,
+            username: supersetUser, password: supersetPass,
             dashboard_id: existingDashboardId ? parseInt(existingDashboardId) : undefined,
         };
         try {
@@ -334,6 +334,12 @@ export default function DataWizz() {
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify(body),
             });
+            if (!resp.ok) {
+                const err = await resp.json().catch(() => ({ error: `Server error ${resp.status}` }));
+                setBuildError(err.error || `Server error ${resp.status}`);
+                setBuildStreaming(false);
+                return;
+            }
             const reader = resp.body.getReader();
             const decoder = new TextDecoder();
             let buf = '';

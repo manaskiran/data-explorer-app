@@ -13,8 +13,8 @@ const getSrPool = (host, port, user, password) => {
   const key = `${host}:${port}:${user}`;
   if (!mysqlPoolCache[key]) {
     mysqlPoolCache[key] = mysql.createPool({
-      host, port: Number(port), user: user || 'root', password: password || '',
-      connectionLimit: 10, connectTimeout: 15000
+      host, port: Number(port), user: user || process.env.SR_DEFAULT_USER || 'root', password: password || '',
+      connectionLimit: 10, connectTimeout: parseInt(process.env.MYSQL_CONNECT_TIMEOUT_MS) || 15000
     });
   }
   return mysqlPoolCache[key];
@@ -54,7 +54,7 @@ const getLayer = (dbName) => {
 const getApp = (dbName) => dbName.replace(/_service(_live|_odoo|_revenue|_odd)?$/, '').replace(/_curated(_live)?$/, '').replace(/_raw$/, '').replace(/_live$/, '').trim();
 
 const isBiTable = (tableName) => /^sr_/i.test(tableName);
-const HIVE_QUERY_TIMEOUT_MS = 15000;
+const HIVE_QUERY_TIMEOUT_MS = parseInt(process.env.HIVE_QUERY_TIMEOUT_MS) || 15000;
 
 const shouldSkipDb = (dbName) => {
   if (['information_schema','sys','_statistics_','starrocks','default','mysql'].includes(dbName)) return true;

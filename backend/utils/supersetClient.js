@@ -376,9 +376,53 @@ class SupersetClient {
                 : setCookie.split(';')[0];
         }
 
-        // Fetch CSRF token
-        const csrfResp = await this._request('GET', '/api/v1/security/csrf_token/');
-        this._csrfToken = csrfResp.result;
+        // Fetch CSRF token — call axios directly so we can capture any new session cookie
+        const csrfResp = await axios({
+            method: 'GET',
+            url: `${this.baseUrl}/api/v1/security/csrf_token/`,
+            headers: this._headers(),
+            validateStatus: () => true,
+        });
+        if (csrfResp.status < 200 || csrfResp.status >= 300) {
+            throw new Error(`Failed to get CSRF token [${csrfResp.status}]: ${JSON.stringify(csrfResp.data)}`);
+        }
+
+        // Merge any updated session cookies returned by the CSRF endpoint FIRST,
+        // so the session is correct before we store the CSRF token
+        const csrfSetCookie = csrfResp.headers['set-cookie'];
+        if (csrfSetCookie) {
+            const newCookies = (Array.isArray(csrfSetCookie) ? csrfSetCookie : [csrfSetCookie])
+                .map(c => c.split(';')[0]);
+            const cookieMap = new Map();
+            this._cookies.split('; ').filter(Boolean).forEach(c => {
+                const [k] = c.split('=');
+                if (k) cookieMap.set(k, c);
+            });
+            newCookies.forEach(c => {
+                const [k] = c.split('=');
+                if (k) cookieMap.set(k, c);
+            });
+            this._cookies = [...cookieMap.values()].join('; ');
+        }
+
+        // Extract CSRF token — try all known response fields across Superset versions
+        this._csrfToken = csrfResp.data?.result
+            || csrfResp.data?.token
+            || csrfResp.data?.csrf_token;
+
+        // Fallback: some Superset configs set the CSRF token as a non-HttpOnly cookie
+        if (!this._csrfToken && csrfSetCookie) {
+            const cookieList = Array.isArray(csrfSetCookie) ? csrfSetCookie : [csrfSetCookie];
+            for (const c of cookieList) {
+                const m = c.match(/^csrf_token=([^;]+)/i);
+                if (m) { this._csrfToken = decodeURIComponent(m[1]); break; }
+            }
+        }
+
+        if (!this._csrfToken) {
+            throw new Error(`CSRF token not returned by Superset (response: ${JSON.stringify(csrfResp.data)}). ` +
+                `Ensure WTF_CSRF_ENABLED is True and the /api/v1/security/csrf_token/ endpoint is accessible.`);
+        }
     }
 
     _headers() {
@@ -403,6 +447,15 @@ class SupersetClient {
 
         // Auto re-auth on 401
         if (resp.status === 401 && this._username) {
+            await this.authenticate();
+            config.headers = this._headers();
+            resp = await axios(config);
+        }
+
+        // Auto re-auth on CSRF failure (400 with "CSRF session token is missing")
+        const isCsrfError = resp.status === 400 &&
+            JSON.stringify(resp.data).toLowerCase().includes('csrf');
+        if (isCsrfError && this._username) {
             await this.authenticate();
             config.headers = this._headers();
             resp = await axios(config);

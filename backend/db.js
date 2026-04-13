@@ -8,9 +8,9 @@ const pgPool = new Pool({
     password: process.env.PG_PASSWORD,
     port:     process.env.PG_PORT,
     // Connection pool tuning for production
-    max:              10,
-    idleTimeoutMillis: 30000,
-    connectionTimeoutMillis: 5000,
+    max:              parseInt(process.env.PG_POOL_MAX)          || 10,
+    idleTimeoutMillis: parseInt(process.env.PG_IDLE_TIMEOUT_MS)  || 30000,
+    connectionTimeoutMillis: parseInt(process.env.PG_CONNECT_TIMEOUT_MS) || 5000,
 });
 
 // Helper: run DDL silently (idempotent schema changes)

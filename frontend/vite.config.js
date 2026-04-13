@@ -38,12 +38,23 @@ export default defineConfig(({ mode }) => {
   }
 
   let httpsConfig = false;
-  if (env.VITE_SSL_KEY_PATH && fs.existsSync(env.VITE_SSL_KEY_PATH) && env.VITE_SSL_CERT_PATH && fs.existsSync(env.VITE_SSL_CERT_PATH)) {
-      httpsConfig = { 
-          key: fs.readFileSync(env.VITE_SSL_KEY_PATH), 
-          cert: fs.readFileSync(env.VITE_SSL_CERT_PATH), 
-          passphrase: env.VITE_SSL_PASSPHRASE 
-      };
+  if (env.VITE_SSL_KEY_PATH && env.VITE_SSL_CERT_PATH) {
+      try {
+          fs.accessSync(env.VITE_SSL_KEY_PATH, fs.constants.R_OK);
+          fs.accessSync(env.VITE_SSL_CERT_PATH, fs.constants.R_OK);
+          httpsConfig = { 
+              key: fs.readFileSync(env.VITE_SSL_KEY_PATH), 
+              cert: fs.readFileSync(env.VITE_SSL_CERT_PATH), 
+              passphrase: env.VITE_SSL_PASSPHRASE 
+          };
+      } catch (e) {
+          console.warn("SSL certs missing or lack read permissions, falling back to HTTP");
+          httpsConfig = false;
+      }
+  }
+
+  if (!httpsConfig && proxyTarget.startsWith('https://')) {
+      proxyTarget = proxyTarget.replace('https://', 'http://');
   }
 
   return {

@@ -48,7 +48,7 @@ function getConnConfig(conn) {
     if (conn.type === 'starrocks') {
         return { port: conn.port, user: conn.username, password: decrypt(conn.password) };
     }
-    return { port: 9030, user: conn.sr_username || process.env.SR_DEFAULT_USER || 'root', password: decrypt(conn.sr_password) || '' };
+    return { port: parseInt(process.env.SR_FE_PORT) || 9030, user: conn.sr_username || process.env.SR_DEFAULT_USER || 'root', password: decrypt(conn.sr_password) || '' };
 }
 
 module.exports = { encrypt, decrypt, getConnConfig };
